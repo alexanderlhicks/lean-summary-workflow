@@ -1,0 +1,45 @@
+name: PR Summary Action
+description: 'Generates a summary for a Pull Request'
+inputs:
+  github_token:
+    description: 'GitHub Token for API calls'
+    required: true
+  gemini_api_key:
+    description: 'Gemini API Key for AI summary generation'
+    required: true
+  github_repository:
+    description: 'The GitHub repository (e.g., owner/repo)'
+    required: true
+  pr_number:
+    description: 'The Pull Request number'
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout PR Code
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0 # Fetch all history to enable diffing against base
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+      shell: bash
+
+    - name: Generate diff
+      run: git diff ${{ github.event.pull_request.base.sha }} HEAD > pr.diff
+      shell: bash
+
+    - name: Generate summary
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        GITHUB_REPOSITORY: ${{ inputs.github_repository }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+      run: python ${{ github.action_path }}/pr-summary.py
+      shell: bash
