@@ -13,19 +13,28 @@ inputs:
   pr_number:
     description: 'The Pull Request number'
     required: true
+  gemini_model:
+    description: 'The Gemini model to use for the summary'
+    required: false
+    default: 'gemini-3-pro-preview'
+  lean_keywords:
+    description: 'Comma-separated list of keywords to track for sorries'
+    required: false
+    default: 'def,abbrev,example,theorem,opaque,lemma,instance'
 runs:
   using: "composite"
   steps:
     - name: Checkout PR Code
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6.0.1
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0 # Fetch all history to enable diffing against base
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v6.1.0
       with:
-        python-version: '3.11'
+        python-version: '3.13'
+        cache: 'pip'
 
     - name: Install dependencies
       run: pip install -r ${{ github.action_path }}/requirements.txt
@@ -41,5 +50,11 @@ runs:
         GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
         GITHUB_REPOSITORY: ${{ inputs.github_repository }}
         PR_NUMBER: ${{ inputs.pr_number }}
-      run: python ${{ github.action_path }}/pr-summary.py
+        INPUT_GEMINI_MODEL: ${{ inputs.gemini_model }}
+        INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
+      run: python ${{ github.action_path }}/summary.py
+      shell: bash
+
+    - name: Clean up diff file
+      run: rm pr.diff
       shell: bash
