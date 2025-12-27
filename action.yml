@@ -21,6 +21,10 @@ inputs:
     description: 'Comma-separated list of keywords to track for sorries'
     required: false
     default: 'def,abbrev,example,theorem,opaque,lemma,instance'
+  style_guide_path:
+    description: 'Optional: Path to a style guide file for adherence checking'
+    required: false
+    default: 'CONTRIBUTING.md'
 runs:
   using: "composite"
   steps:
@@ -52,6 +56,7 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number }}
         INPUT_GEMINI_MODEL: ${{ inputs.gemini_model }}
         INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
+        INPUT_STYLE_GUIDE_PATH: ${{ inputs.style_guide_path }}
       run: python ${{ github.action_path }}/summary.py
       shell: bash
 

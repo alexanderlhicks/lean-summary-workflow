@@ -9,7 +9,7 @@ from github import Github, Auth
 MAX_DIFF_TOKENS = 1_500_000
 COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
 
-# --- AI Summary Generation ---
+# --- AI Generation ---
 
 def _call_gemini(prompt, model_name):
     """A helper function to call the Gemini API and handle errors."""
@@ -18,57 +18,51 @@ def _call_gemini(prompt, model_name):
         response = model.generate_content(prompt, request_options={'timeout': 180})
         return response.text
     except Exception as e:
-        # For individual file summaries, we don't want to fail the whole run.
-        # For the final synthesis, the error will be caught by the main block's caller.
         print(f"Warning: Gemini API call failed. {e}")
-        return f"Error summarizing: {e}"
+        return f"Error: {e}"
+
+def _read_prompt_template(template_name: str) -> str:
+    action_path = os.path.dirname(os.path.realpath(__file__))
+    prompt_template_path = os.path.join(action_path, "prompts", template_name)
+    try:
+        with open(prompt_template_path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        sys.exit(f"Error: Prompt template not found at {prompt_template_path}")
 
 def split_diff_into_files(diff_content):
     """Splits a full git diff into a dictionary of per-file diffs."""
     files = {}
-    # Use a regex to split the diff by the file header, keeping the header
     file_diffs = re.split(r'(?=diff --git a/.+ b/.+)', diff_content)
     for file_diff in file_diffs:
-        if not file_diff.strip():
-            continue
+        if not file_diff.strip(): continue
         match = re.search(r'diff --git a/(.+) b/(.+)', file_diff)
         if match:
-            # The 'b' path is the new or current path of the file
-            file_path = match.group(2)
-            files[file_path] = file_diff
+            files[match.group(2)] = file_diff
     return files
 
 def summarize_file_diff(file_path, file_diff, model_name):
     """Generates a summary for a single file's diff (Map step)."""
-    prompt = f"""
-    Please provide a concise, one-sentence summary for the changes in the file `{file_path}`.
-    Focus on the primary purpose of the changes.
-
-    Diff:
-    {file_diff}
-    """
+    prompt_template = _read_prompt_template("summarize_file.txt")
+    prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
     return _call_gemini(prompt, model_name)
 
 def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body):
-    """Synthesizes a final summary from a list of per-file summaries (Reduce step)."""
+    """Synthesizes a final summary from per-file summaries (Reduce step)."""
     summaries_text = "\n".join(f"- {s}" for s in per_file_summaries)
+    prompt_template = _read_prompt_template("synthesize_summary.md")
+    prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
+                            .replace("{{PR_BODY}}", pr_body) \
+                            .replace("{{PER_FILE_SUMMARIES}}", summaries_text)
+    return _call_gemini(prompt, model_name)
 
-    prompt = f"""
-You are a senior software engineer summarizing a pull request for a code review.
-Based on the PR title, body, and the following per-file summaries, please provide a structured, high-level summary of the entire pull request.
-    Categorize the changes into the following sections:
-    - **Features**: New functionality added.
-    - **Fixes**: Bug fixes.
-    - **Refactoring**: Code improvements without changing behavior.
-    - **Documentation**: Changes to comments or documentation files.
-
-    PR Title: {pr_title}
-    PR Body:
-    {pr_body}
-
-    Per-File Summaries:
-    {summaries_text}
-    """
+def check_style_adherence(diff_content, style_guide_content, model_name):
+    """Checks the diff against a style guide."""
+    if not style_guide_content:
+        return None
+    prompt_template = _read_prompt_template("check_style.md")
+    prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
+                            .replace("{{DIFF_CONTENT}}", diff_content)
     return _call_gemini(prompt, model_name)
 
 # --- Diff Analysis ---
@@ -147,13 +141,9 @@ class DiffAnalyzer:
             self.lines_added += 1
         elif line.startswith('-'):
             self.lines_removed += 1
-
         self._track_sorries(line)
-
-        if line.startswith('+'):
-            self._new_line_num += 1
-        elif line.startswith('-'):
-            self._old_line_num += 1
+        if line.startswith('+'): self._new_line_num += 1
+        elif line.startswith('-'): self._old_line_num += 1
         else:
             self._old_line_num += 1
             self._new_line_num += 1
@@ -163,23 +153,13 @@ class DiffAnalyzer:
         if any(stripped_line.startswith(keyword + ' ') for keyword in self._sorry_keywords):
             self._current_decl_header = re.sub(r"^[+-]\s*", "", line)
             name_match = self._name_extract_regex.match(self._current_decl_header)
-            if name_match:
-                self._current_decl_name = name_match.group(1)
-
+            if name_match: self._current_decl_name = name_match.group(1)
         if 'sorry' in line and self._current_decl_name:
             comment_pos = line.find("--")
             sorry_pos = line.find("sorry")
-            if comment_pos != -1 and sorry_pos > comment_pos:
-                return
-
+            if comment_pos != -1 and sorry_pos > comment_pos: return
             stable_id = f"{self._current_decl_name}@{self._current_file}"
-            sorry_info = {
-                'id': stable_id,
-                'file': self._current_file,
-                'name': self._current_decl_name,
-                'header': self._current_decl_header.split(":=")[0].strip()
-            }
-
+            sorry_info = {'id': stable_id, 'file': self._current_file, 'name': self._current_decl_name, 'header': self._current_decl_header.split(":=")[0].strip()}
             if line.startswith('+'):
                 sorry_info['line'] = self._new_line_num
                 self._raw_added[stable_id] = sorry_info
@@ -188,87 +168,34 @@ class DiffAnalyzer:
                 self._raw_removed[stable_id] = sorry_info
     
     def _categorize_sorries(self):
-        added_ids = set(self._raw_added.keys())
-        removed_ids = set(self._raw_removed.keys())
+        added_ids, removed_ids = set(self._raw_added.keys()), set(self._raw_removed.keys())
         affected_ids = added_ids.intersection(removed_ids)
-
-        for sid in affected_ids:
-            self.affected_sorries.append({
-                'id': sid,
-                'file': self._raw_added[sid]['file'],
-                'context': self._raw_added[sid]['header'],
-                'old_line': self._raw_removed[sid]['line'],
-                'new_line': self._raw_added[sid]['line']
-            })
-
-        for sid in added_ids - affected_ids:
-            self.added_sorries.append(f"`{self._raw_added[sid]['header']}` in `{self._raw_added[sid]['file']}`")
-
-        for sid in removed_ids - affected_ids:
-            self.removed_sorries.append(f"`{self._raw_removed[sid]['header']}` in `{self._raw_removed[sid]['file']}`")
+        for sid in affected_ids: self.affected_sorries.append({'id': sid, 'file': self._raw_added[sid]['file'], 'context': self._raw_added[sid]['header'], 'old_line': self._raw_removed[sid]['line'], 'new_line': self._raw_added[sid]['line']})
+        for sid in added_ids - affected_ids: self.added_sorries.append(f"`{self._raw_added[sid]['header']}` in `{self._raw_added[sid]['file']}`")
+        for sid in removed_ids - affected_ids: self.removed_sorries.append(f"`{self._raw_removed[sid]['header']}` in `{self._raw_removed[sid]['file']}`")
 
 # --- Comment Formatting ---
-def format_summary(ai_summary, stats, added_sorries, removed_sorries, affected_sorries, truncated, issues, per_file_summaries):
+def format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report):
     """Formats the final summary comment in Markdown."""
-    
-    timestamp_str = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
-    unique_comment_identifier = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp_str)
-    summary = f"### 🤖 Gemini PR Summary\n\n{unique_comment_identifier}\n\n"
-    summary += f"{ai_summary}\n"
-    if truncated:
-        summary += "> *Note: The diff was too large to be fully analyzed and was truncated.*\\n"
-    
-    summary += "\n---\n\n"
-    summary += "**Analysis of Changes**\n\n"
-    summary += "| Metric | Count |\n| --- | --- |\n"
-    summary += f"| 📝 **Files Changed** | {stats['files_changed']} |\n"
-    summary += f"| ✅ **Lines Added** | {stats['lines_added']} |\n"
-    summary += f"| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
-
-    summary += "\n---\n\n"
-    summary += "**`sorry` Tracking**\n\n"
-    
-    if removed_sorries:
-        summary += f"<details><summary>✅ **Removed:** {len(removed_sorries)} `sorry`(s)</summary>\n\n"
-        for sorry in removed_sorries:
-            summary += f"*   {sorry}\n"
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
+    comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
+    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{ai_summary}\n"
+    if truncated: summary += "> *Note: The diff was too large and was truncated.*\n"
+    summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
+    summary += "\n---\n\n**`sorry` Tracking**\n\n"
+    if removed: summary += f"<details><summary>✅ **Removed:** {len(removed)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+    if added: summary += f"<details><summary>❌ **Added:** {len(added)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+    if affected:
+        summary += f"<details><summary>✏️ **Affected:** {len(affected)} `sorry`(s) (line number changed)</summary>\n\n"
+        for s in affected:
+            issue_link = next((f" (Issue #{issue.number})" for issue in issues if issue.body and f"<!-- sorry-tracker-id: {s['id']} -->" in issue.body), "")
+            summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}{issue_link}\n"
         summary += "</details>\n"
-    
-    if added_sorries:
-        summary += f"<details><summary>❌ **Added:** {len(added_sorries)} `sorry`(s)</summary>\n\n"
-        for sorry in added_sorries:
-            summary += f"*   {sorry}\n"
-        summary += "</details>\n"
-
-    if affected_sorries:
-        summary += f"<details><summary>✏️ **Affected:** {len(affected_sorries)} `sorry`(s) (line number changed)</summary>\n\n"
-        for sorry in affected_sorries:
-            # Find the corresponding issue by searching for the stable ID in the issue body
-            issue_link = ""
-            stable_id_comment = f"<!-- sorry-tracker-id: {sorry['id']} -->"
-            for issue in issues:
-                if issue.body and stable_id_comment in issue.body:
-                    issue_link = f" (Issue #{issue.number})"
-                    break
-            summary += f"*   `{sorry['context']}` in `{sorry['file']}` moved from L{sorry['old_line']} to L{sorry['new_line']}{issue_link}\n"
-        summary += "</details>\n"
-
-    if not added_sorries and not removed_sorries and not affected_sorries:
-        summary += "*   No `sorry`s were added, removed, or affected.\n"
-
-    # --- Append Per-File Summaries ---
-    if per_file_summaries:
-        summary += "\n---\n\n"
-        summary += "<details><summary>📄 **Per-File Summaries**</summary>\n\n"
-        for file_summary in per_file_summaries:
-            summary += f"*   {file_summary}\n"
-        summary += "</details>\n"
-
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    summary += f"\n---\n\n*Last updated: {timestamp}. See the [main CI run](https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions) for build status.*"
-    
+    if not any([added, removed, affected]): summary += "*   No `sorry`s were added, removed, or affected.\n"
+    if style_report: summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
+    if per_file_summaries: summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in per_file_summaries) + "</details>\n"
+    summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
-
 
 def find_sorry_issues(repo):
     """Finds all open issues with the 'proof wanted' label."""
@@ -289,13 +216,8 @@ def get_github_objects(token, repo_name, pr_number):
 
 def post_github_comment(pr, summary):
     """Finds and updates an existing comment or creates a new one."""
-    existing_comment = None
     comment_regex = re.compile(COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"))
-    for comment in pr.get_issue_comments():
-        if comment_regex.search(comment.body):
-            existing_comment = comment
-            break
-    
+    existing_comment = next((c for c in pr.get_issue_comments() if comment_regex.search(c.body)), None)
     if existing_comment:
         existing_comment.edit(summary)
         print("Updated existing comment.")
@@ -307,65 +229,54 @@ def post_github_comment(pr, summary):
 def main():
     """Main execution block."""
     if "GEMINI_API_KEY" not in os.environ:
-        print("Error: GEMINI_API_KEY environment variable not set.")
-        sys.exit(1)
+        sys.exit("Error: GEMINI_API_KEY environment variable not set.")
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-    gemini_model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-pro-preview')
-    lean_keywords_str = os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance')
-    lean_keywords = [k.strip() for k in lean_keywords_str.split(',')]
+    model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-pro-preview')
+    keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance').split(',')]
+    style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
 
     try:
         with open("pr.diff", "r") as f:
             diff = f.read()
     except FileNotFoundError:
-        print("Error: pr.diff not found.")
-        sys.exit(1)
+        sys.exit("Error: pr.diff not found.")
 
-    analyzer = DiffAnalyzer(lean_keywords)
-    stats, added_sorries, removed_sorries, affected_sorries = analyzer.analyze(diff)
+    analyzer = DiffAnalyzer(keywords)
+    stats, added, removed, affected = analyzer.analyze(diff)
 
-    pr_title = ""
-    pr_body = ""
-    issues = []
-    repo = None
-    pr = None
+    repo, pr, issues, pr_title, pr_body = None, None, [], "", ""
+    if "GITHUB_TOKEN" in os.environ:
+        repo, pr = get_github_objects(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], int(os.environ["PR_NUMBER"]))
+        issues, pr_title, pr_body = find_sorry_issues(repo), pr.title, pr.body or ""
 
-    github_token = os.environ.get("GITHUB_TOKEN")
-    if github_token:
-        repo_name = os.environ["GITHUB_REPOSITORY"]
-        pr_number = int(os.environ["PR_NUMBER"])
-        repo, pr = get_github_objects(github_token, repo_name, pr_number)
-        issues = find_sorry_issues(repo)
-        pr_title = pr.title
-        pr_body = pr.body or ""
-
-    # --- Hierarchical Summary Generation ---
     truncated = len(diff) > MAX_DIFF_TOKENS
-    if truncated:
-        diff = diff[:MAX_DIFF_TOKENS]
+    if truncated: diff = diff[:MAX_DIFF_TOKENS]
 
-    # "Map" step: Summarize each file's diff
+    style_guide_content = ""
+    if style_guide_path:
+        try:
+            with open(style_guide_path, "r") as f:
+                style_guide_content = f.read()
+        except FileNotFoundError:
+            print(f"Warning: Style guide file not found at {style_guide_path}")
+
+    style_report = check_style_adherence(diff, style_guide_content, model_name) if style_guide_content else None
+
     diff_by_file = split_diff_into_files(diff)
-    per_file_summaries = []
-    for file_path, file_diff in diff_by_file.items():
-        summary = summarize_file_diff(file_path, file_diff, gemini_model_name)
-        per_file_summaries.append(f"**{file_path}**: {summary.strip()}")
+    per_file_summaries = [f"**{fp}**: {summarize_file_diff(fp, fd, model_name).strip()}" for fp, fd in diff_by_file.items()]
 
-    # "Reduce" step: Synthesize a final summary
     try:
-        ai_summary = synthesize_summary(per_file_summaries, gemini_model_name, pr_title, pr_body)
+        ai_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body)
     except Exception as e:
         raise RuntimeError(f"Error synthesizing final summary: {e}")
 
-    final_summary = format_summary(ai_summary, stats, added_sorries, removed_sorries, affected_sorries, truncated, issues, per_file_summaries)
+    final_summary = format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report)
     
     if pr:
         post_github_comment(pr, final_summary)
     else:
-
-        print("Not in GitHub Actions context. Printing summary instead of posting:")
-        print(final_summary)
+        print("Not in a GitHub Actions context. Printing summary instead:\n", final_summary)
 
 if __name__ == "__main__":
     main()
