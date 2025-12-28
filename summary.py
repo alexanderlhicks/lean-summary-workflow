@@ -15,7 +15,7 @@ def _call_gemini(prompt, model_name):
     """A helper function to call the Gemini API and handle errors."""
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        response = client.models.generate_content(model=model_name, contents=prompt, request_options={'timeout': 180})
+        response = client.models.generate_content(model=model_name, contents=prompt, timeout=180)
         return response.text
     except Exception as e:
         print(f"Warning: Gemini API call failed. {e}")
@@ -43,7 +43,7 @@ def split_diff_into_files(diff_content):
 
 def summarize_file_diff(file_path, file_diff, model_name):
     """Generates a summary for a single file's diff (Map step)."""
-    prompt_template = _read_prompt_template("summarize_file.txt")
+    prompt_template = _read_prompt_template("summarize_file.md")
     prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
     return _call_gemini(prompt, model_name)
 
