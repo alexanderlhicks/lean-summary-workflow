@@ -90,7 +90,7 @@ class DiffAnalyzer:
         self._hunk_header_regex = re.compile(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@')
         keywords_regex_part = "|".join(re.escape(k) for k in self._sorry_keywords)
         self._name_extract_regex = re.compile(
-            r".*??(?:{})\s+([^\s\(\{{:]+)".format(keywords_regex_part)
+            r".*?(?:{})\s+([^\s\(\{{:]+)".format(keywords_regex_part)
         )
 
     def analyze(self, diff):
