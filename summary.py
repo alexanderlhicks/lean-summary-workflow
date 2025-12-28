@@ -269,7 +269,7 @@ def main():
         sys.exit("Error: GEMINI_API_KEY environment variable not set.")
 
 
-    model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-pro-preview')
+    model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-flash-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance').split(',')]
     style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
 

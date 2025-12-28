@@ -53,8 +53,8 @@ jobs:
           pr_number: ${{ github.event.pull_request.number }}
           # Optional: Path to a style guide file (defaults to 'CONTRIBUTING.md')
           # style_guide_path: 'docs/my-style-guide.md'
-          # Optional: Specify a different Gemini model (default: 'gemini-3-pro-preview')
-          # gemini_model: "gemini-3-pro-preview"
+          # Optional: Specify a different Gemini model (default: 'gemini-3-flash-preview')
+          # gemini_model: "gemini-3-flash-preview"
           # Optional: Comma-separated list of keywords to track for sorrys (default: 'def,abbrev,example,theorem,opaque,lemma,instance')
           # lean_keywords: 'def,lemma'
 ```
@@ -67,7 +67,7 @@ jobs:
 | `gemini_api_key` | The API key for the Gemini API, used for summary generation. Store this as a secret in your repository. | `true` | |
 | `github_repository` | The GitHub repository in the format `owner/repo`. Should be set to `${{ github.repository }}`. | `true` | |
 | `pr_number` | The pull request number. Should be set to `${{ github.event.pull_request.number }}`. | `true` | |
-| `gemini_model` | The Gemini model to use for the summary. | `false` | `gemini-3-pro-preview` |
+| `gemini_model` | The Gemini model to use for the summary. | `false` | `gemini-3-flash-preview` |
 | `lean_keywords`| A comma-separated list of keywords to track for `sorry`s in `.lean` files. | `false` | `def,abbrev,example,theorem,opaque,lemma,instance` |
 | `style_guide_path`| Optional: Path to a style guide file within the repository for adherence checking. | `false` | `CONTRIBUTING.md` |
 

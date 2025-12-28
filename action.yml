@@ -16,7 +16,7 @@ inputs:
   gemini_model:
     description: 'The Gemini model to use for the summary'
     required: false
-    default: 'gemini-3-pro-preview'
+    default: 'gemini-3-flash-preview'
   lean_keywords:
     description: 'Comma-separated list of keywords to track for sorries'
     required: false
