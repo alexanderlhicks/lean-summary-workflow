@@ -15,7 +15,7 @@ def _call_gemini(prompt, model_name):
     """A helper function to call the Gemini API and handle errors."""
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        response = client.models.generate_content(model=model_name, contents=prompt, timeout=180)
+        response = client.models.generate_content(model=model_name, contents=prompt)
         return response.text
     except Exception as e:
         print(f"Warning: Gemini API call failed. {e}")
