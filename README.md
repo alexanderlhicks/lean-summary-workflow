@@ -54,7 +54,7 @@ jobs:
           # Optional: Path to a style guide file (defaults to 'CONTRIBUTING.md')
           # style_guide_path: 'docs/my-style-guide.md'
           # Optional: Specify a different Gemini model (default: 'gemini-3-pro-preview')
-          # gemini_model: "gemini-1.5-pro-preview"
+          # gemini_model: "gemini-3-pro-preview"
           # Optional: Comma-separated list of keywords to track for sorrys (default: 'def,abbrev,example,theorem,opaque,lemma,instance')
           # lean_keywords: 'def,lemma'
 ```
