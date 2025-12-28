@@ -2,7 +2,7 @@ import os
 import re
 import sys
 from datetime import datetime
-import google.generativeai as genai
+from google import genai
 from github import Github, Auth
 
 # --- Constants ---
@@ -14,8 +14,8 @@ COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
 def _call_gemini(prompt, model_name):
     """A helper function to call the Gemini API and handle errors."""
     try:
-        model = genai.GenerativeModel(model_name)
-        response = model.generate_content(prompt, request_options={'timeout': 180})
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        response = client.models.generate_content(model=model_name, contents=prompt, request_options={'timeout': 180})
         return response.text
     except Exception as e:
         print(f"Warning: Gemini API call failed. {e}")
@@ -230,7 +230,7 @@ def main():
     """Main execution block."""
     if "GEMINI_API_KEY" not in os.environ:
         sys.exit("Error: GEMINI_API_KEY environment variable not set.")
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
 
     model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-pro-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance').split(',')]
