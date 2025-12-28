@@ -1,13 +1,18 @@
 import os
 import re
 import sys
+import json
+import hashlib
 from datetime import datetime
 from google import genai
-from github import Github, Auth
+from github import Github, Auth, GitCommit
+from github.PullRequest import PullRequest
+from github.Repository import Repository
 
 # --- Constants ---
 MAX_DIFF_TOKENS = 1_500_000
 COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
+CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
 # --- AI Generation ---
 
@@ -174,12 +179,40 @@ class DiffAnalyzer:
         for sid in added_ids - affected_ids: self.added_sorries.append(f"`{self._raw_added[sid]['header']}` in `{self._raw_added[sid]['file']}`")
         for sid in removed_ids - affected_ids: self.removed_sorries.append(f"`{self._raw_removed[sid]['header']}` in `{self._raw_removed[sid]['file']}`")
 
+# --- Caching ---
+class SummaryCache:
+    """Handles caching of file diff summaries."""
+    def __init__(self, pr: PullRequest):
+        self._cache = self._load_from_comment(pr)
+
+    def _load_from_comment(self, pr: PullRequest):
+        comment = find_existing_comment(pr)
+        if comment and CACHE_IDENTIFIER in comment.body:
+            try:
+                cache_str = comment.body.split(CACHE_IDENTIFIER, 1)[1].split("-->", 1)[0]
+                return json.loads(cache_str)
+            except (IndexError, json.JSONDecodeError):
+                return {}
+        return {}
+
+    def get(self, file_path, file_diff_hash):
+        if file_path in self._cache and self._cache[file_path]['hash'] == file_diff_hash:
+            return self._cache[file_path]['summary']
+        return None
+
+    def update(self, file_path, file_diff_hash, summary):
+        self._cache[file_path] = {'hash': file_diff_hash, 'summary': summary}
+
+    def to_json(self):
+        return json.dumps(self._cache)
+
 # --- Comment Formatting ---
-def format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report):
+def format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report, cache):
     """Formats the final summary comment in Markdown."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
-    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{ai_summary}\n"
+    cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->"
+    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}\n\n{ai_summary}\n"
     if truncated: summary += "> *Note: The diff was too large and was truncated.*\n"
     summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
     summary += "\n---\n\n**`sorry` Tracking**\n\n"
@@ -197,7 +230,7 @@ def format_summary(ai_summary, stats, added, removed, affected, truncated, issue
     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
 
-def find_sorry_issues(repo):
+def find_sorry_issues(repo: Repository):
     """Finds all open issues with the 'proof wanted' label."""
     try:
         return repo.get_issues(state="open", labels=["proof wanted"])
@@ -214,10 +247,14 @@ def get_github_objects(token, repo_name, pr_number):
     pr = repo.get_pull(pr_number)
     return repo, pr
 
-def post_github_comment(pr, summary):
-    """Finds and updates an existing comment or creates a new one."""
+def find_existing_comment(pr: PullRequest):
+    """Finds a comment previously posted by this action."""
     comment_regex = re.compile(COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"))
-    existing_comment = next((c for c in pr.get_issue_comments() if comment_regex.search(c.body)), None)
+    return next((c for c in pr.get_issue_comments() if comment_regex.search(c.body)), None)
+
+def post_github_comment(pr: PullRequest, summary: str):
+    """Finds and updates an existing comment or creates a new one."""
+    existing_comment = find_existing_comment(pr)
     if existing_comment:
         existing_comment.edit(summary)
         print("Updated existing comment.")
@@ -264,14 +301,30 @@ def main():
     style_report = check_style_adherence(diff, style_guide_content, model_name) if style_guide_content else None
 
     diff_by_file = split_diff_into_files(diff)
-    per_file_summaries = [f"**{fp}**: {summarize_file_diff(fp, fd, model_name).strip()}" for fp, fd in diff_by_file.items()]
+    per_file_summaries = []
+    
+    cache = SummaryCache(pr) if pr else None
+    
+    for fp, fd in diff_by_file.items():
+        file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
+        summary = cache.get(fp, file_diff_hash) if cache else None
+        
+        if summary:
+            print(f"Cache hit for {fp}")
+        else:
+            print(f"Cache miss for {fp}")
+            summary = summarize_file_diff(fp, fd, model_name).strip()
+            if cache:
+                cache.update(fp, file_diff_hash, summary)
+        
+        per_file_summaries.append(f"**{fp}**: {summary}")
 
     try:
         ai_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body)
     except Exception as e:
         raise RuntimeError(f"Error synthesizing final summary: {e}")
 
-    final_summary = format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report)
+    final_summary = format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report, cache)
     
     if pr:
         post_github_comment(pr, final_summary)
