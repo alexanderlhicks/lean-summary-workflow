@@ -1,0 +1,185 @@
+diff --git a/action.yml b/action.yml
+index d66243c..fe836fe 100644
+--- a/action.yml
++++ b/action.yml
+@@ -18,9 +18,9 @@ inputs:
+     required: false
+     default: 'gemini-3-flash-preview'
+   lean_keywords:
+-    description: 'Comma-separated list of keywords to track for sorries'
++    description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
+     required: false
+-    default: 'def,abbrev,example,theorem,opaque,lemma,instance'
++    default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom'
+   style_guide_path:
+     description: 'Optional: Path to a style guide file for adherence checking'
+     required: false
+@@ -69,4 +69,4 @@ runs:
+       run: |
+         rm pr.diff
+         rm ./action-requirements.txt
+-      shell: bash
+\ No newline at end of file
++      shell: bash
+diff --git a/summary.py b/summary.py
+index 6dba4f1..8aa77b0 100644
+--- a/summary.py
++++ b/summary.py
+@@ -74,14 +74,17 @@ def check_style_adherence(diff_content, style_guide_content, model_name):
+ class DiffAnalyzer:
+     """Parses a git diff to extract statistics and track 'sorry's."""
+ 
+-    def __init__(self, sorry_keywords):
++    def __init__(self, decl_keywords):
+         self.files_changed = set()
+         self.lines_added = 0
+         self.lines_removed = 0
+         self.added_sorries = []
+         self.removed_sorries = []
+         self.affected_sorries = []
+-        self._sorry_keywords = sorry_keywords
++        self.added_decls = []
++        self.removed_decls = []
++        self.affected_decls = []
++        self._decl_keywords = decl_keywords
+ 
+         self._current_file = ""
+         self._old_line_num = 0
+@@ -90,10 +93,12 @@ class DiffAnalyzer:
+         self._current_decl_name = ""
+         self._raw_added = {}
+         self._raw_removed = {}
++        self._raw_added_decls = {}
++        self._raw_removed_decls = {}
+ 
+         self._file_path_regex = re.compile(r'diff --git a/(.+) b/(.+)')
+         self._hunk_header_regex = re.compile(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@')
+-        keywords_regex_part = "|".join(re.escape(k) for k in self._sorry_keywords)
++        keywords_regex_part = "|".join(re.escape(k) for k in self._decl_keywords)
+         self._name_extract_regex = re.compile(
+             r".*?(?:{})\s+([^\s\(\{{:]+)".format(keywords_regex_part)
+         )
+@@ -113,13 +118,14 @@ class DiffAnalyzer:
+             self._process_line(line)
+ 
+         self._categorize_sorries()
++        self._categorize_decls()
+ 
+         stats = {
+             "files_changed": len(self.files_changed),
+             "lines_added": self.lines_added,
+             "lines_removed": self.lines_removed,
+         }
+-        return stats, self.added_sorries, self.removed_sorries, self.affected_sorries
++        return stats, self.added_sorries, self.removed_sorries, self.affected_sorries, self.added_decls, self.removed_decls, self.affected_decls
+ 
+     def _parse_file_header(self, line):
+         match = self._file_path_regex.match(line)
+@@ -155,10 +161,20 @@ class DiffAnalyzer:
+ 
+     def _track_sorries(self, line):
+         stripped_line = line.lstrip('+- ')
+-        if any(stripped_line.startswith(keyword + ' ') for keyword in self._sorry_keywords):
++        if any(stripped_line.startswith(keyword + ' ') for keyword in self._decl_keywords):
+             self._current_decl_header = re.sub(r"^[+-]\s*", "", line)
+             name_match = self._name_extract_regex.match(self._current_decl_header)
+-            if name_match: self._current_decl_name = name_match.group(1)
++            if name_match:
++                self._current_decl_name = name_match.group(1)
++                stable_id = f"{self._current_decl_name}@{self._current_file}"
++                decl_info = {'id': stable_id, 'file': self._current_file, 'name': self._current_decl_name, 'header': self._current_decl_header.split(":=")[0].strip()}
++                if line.startswith('+'):
++                    decl_info['line'] = self._new_line_num
++                    self._raw_added_decls[stable_id] = decl_info
++                elif line.startswith('-'):
++                    decl_info['line'] = self._old_line_num
++                    self._raw_removed_decls[stable_id] = decl_info
++
+         if 'sorry' in line and self._current_decl_name:
+             comment_pos = line.find("--")
+             sorry_pos = line.find("sorry")
+@@ -172,6 +188,16 @@ class DiffAnalyzer:
+                 sorry_info['line'] = self._old_line_num
+                 self._raw_removed[stable_id] = sorry_info
+     
++    def _categorize_decls(self):
++        added_ids, removed_ids = set(self._raw_added_decls.keys()), set(self._raw_removed_decls.keys())
++        affected_ids = added_ids.intersection(removed_ids)
++        for sid in affected_ids:
++            self.affected_decls.append({'id': sid, 'file': self._raw_added_decls[sid]['file'], 'context': self._raw_added_decls[sid]['header'], 'old_line': self._raw_removed_decls[sid]['line'], 'new_line': self._raw_added_decls[sid]['line']})
++        for sid in added_ids - affected_ids:
++            self.added_decls.append(f"`{self._raw_added_decls[sid]['header']}` in `{self._raw_added_decls[sid]['file']}`")
++        for sid in removed_ids - affected_ids:
++            self.removed_decls.append(f"`{self._raw_removed_decls[sid]['header']}` in `{self._raw_removed_decls[sid]['file']}`")
++
+     def _categorize_sorries(self):
+         added_ids, removed_ids = set(self._raw_added.keys()), set(self._raw_removed.keys())
+         affected_ids = added_ids.intersection(removed_ids)
+@@ -207,7 +233,7 @@ class SummaryCache:
+         return json.dumps(self._cache)
+ 
+ # --- Comment Formatting ---
+-def format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report, cache):
++def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache):
+     """Formats the final summary comment in Markdown."""
+     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
+     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
+@@ -215,6 +241,16 @@ def format_summary(ai_summary, stats, added, removed, affected, truncated, issue
+     summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}\n\n{ai_summary}\n"
+     if truncated: summary += "> *Note: The diff was too large and was truncated.*\n"
+     summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
++    
++    summary += "\n---\n\n**Lean Declarations**\n\n"
++    if removed_decls: summary += f"<details><summary>✅ **Removed:** {len(removed_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed_decls) + "</details>\n"
++    if added_decls: summary += f"<details><summary>❌ **Added:** {len(added_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added_decls) + "</details>\n"
++    if affected_decls:
++        summary += f"<details><summary>✏️ **Affected:** {len(affected_decls)} declaration(s) (line number changed)</summary>\n\n"
++        for s in affected_decls: summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}\n"
++        summary += "</details>\n"
++    if not any([added_decls, removed_decls, affected_decls]): summary += "*   No declarations were added, removed, or affected.\n"
++
+     summary += "\n---\n\n**`sorry` Tracking**\n\n"
+     if removed: summary += f"<details><summary>✅ **Removed:** {len(removed)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+     if added: summary += f"<details><summary>❌ **Added:** {len(added)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+@@ -225,6 +261,7 @@ def format_summary(ai_summary, stats, added, removed, affected, truncated, issue
+             summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}{issue_link}\n"
+         summary += "</details>\n"
+     if not any([added, removed, affected]): summary += "*   No `sorry`s were added, removed, or affected.\n"
++    
+     if style_report: summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
+     if per_file_summaries: summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in per_file_summaries) + "</details>\n"
+     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
+@@ -270,7 +307,7 @@ def main():
+ 
+ 
+     model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-flash-preview')
+-    keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance').split(',')]
++    keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
+     style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
+ 
+     try:
+@@ -280,7 +317,7 @@ def main():
+         sys.exit("Error: pr.diff not found.")
+ 
+     analyzer = DiffAnalyzer(keywords)
+-    stats, added, removed, affected = analyzer.analyze(diff)
++    stats, added, removed, affected, added_decls, removed_decls, affected_decls = analyzer.analyze(diff)
+ 
+     repo, pr, issues, pr_title, pr_body = None, None, [], "", ""
+     if "GITHUB_TOKEN" in os.environ:
+@@ -324,7 +361,7 @@ def main():
+     except Exception as e:
+         raise RuntimeError(f"Error synthesizing final summary: {e}")
+ 
+-    final_summary = format_summary(ai_summary, stats, added, removed, affected, truncated, issues, per_file_summaries, style_report, cache)
++    final_summary = format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache)
+     
+     if pr:
+         post_github_comment(pr, final_summary)
+@@ -332,4 +369,4 @@ def main():
+         print("Not in a GitHub Actions context. Printing summary instead:\n", final_summary)
+ 
+ if __name__ == "__main__":
+-    main()
++    main()
+\ No newline at end of file
