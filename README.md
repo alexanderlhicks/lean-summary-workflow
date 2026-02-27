@@ -6,10 +6,12 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 
 ## Features
 
-*   **AI-Powered PR Summarization:** Generates a concise, high-level summary of pull request changes. For PRs affecting multiple files, it summarizes each file individually and then synthesizes these into an overall summary.
-*   **Lean `sorry` Tracking:** Identifies and tracks `sorry` usages in Lean files, helping to manage formalization completeness.
-*   **Optional Style Guide Adherence Check:** Can automatically review code changes against a specified style guide (e.g., `CONTRIBUTING.md`) to ensure consistency.
-*   **Customizable AI Prompts:** The AI's behavior and output can be easily tailored by modifying external Markdown prompt files.
+*   **Multi-Agent Orchestration:** Employs a pipeline of specialized AI agents (Triage, Summarizer, Synthesizer, Refiner) to ensure high-quality, professional summaries.
+*   **High Performance:** Utilizes asynchronous, parallel execution to summarize multiple files simultaneously, drastically reducing the time required for large pull requests.
+*   **Smart Triage:** Automatically filters out noise (lockfiles, binaries, generated code) to focus the summary on meaningful changes and save on token costs.
+*   **Lean-Aware Analysis:** Tracks `sorry` usages and declaration changes in Lean files, and identifies citations of academic literature or reference materials.
+*   **Optional Style Guide Adherence Check:** Automatically reviews code changes against a specified style guide (e.g., `CONTRIBUTING.md`) to ensure consistency.
+*   **Customizable AI Prompts:** The behavior and persona of each agent can be easily tailored by modifying external Markdown prompt files.
 
 
 ## How it Works
@@ -56,7 +58,7 @@ jobs:
           # style_guide_path: 'docs/my-style-guide.md'
           # Optional: Specify a different Gemini model (default: 'gemini-3-flash-preview')
           # gemini_model: "gemini-3-flash-preview"
-          # Optional: Comma-separated list of keywords to track for sorrys (default: 'def,abbrev,example,theorem,opaque,lemma,instance')
+          # Optional: Comma-separated list of keywords to track for sorrys (default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom')
           # lean_keywords: 'def,lemma'
 ```
 
@@ -69,7 +71,7 @@ jobs:
 | `github_repository` | The GitHub repository in the format `owner/repo`. Should be set to `${{ github.repository }}`. | `true` | |
 | `pr_number` | The pull request number. Should be set to `${{ github.event.pull_request.number }}`. | `true` | |
 | `gemini_model` | The Gemini model to use for the summary. | `false` | `gemini-3-flash-preview` |
-| `lean_keywords`| A comma-separated list of keywords to track for `sorry`s in `.lean` files. | `false` | `def,abbrev,example,theorem,opaque,lemma,instance` |
+| `lean_keywords`| A comma-separated list of keywords to track for `sorry`s in `.lean` files. | `false` | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
 | `style_guide_path`| Optional: Path to a style guide file within the repository for adherence checking. | `false` | `CONTRIBUTING.md` |
 
 ## Customizing AI Prompts
