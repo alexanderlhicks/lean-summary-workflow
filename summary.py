@@ -17,11 +17,14 @@ CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
 # --- AI Generation ---
 
-def _call_gemini(prompt, model_name):
+def _call_gemini(prompt, model_name, response_mime_type=None):
     """A helper function to call the Gemini API and handle errors."""
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        response = client.models.generate_content(model=model_name, contents=prompt)
+        kwargs = {}
+        if response_mime_type:
+            kwargs["config"] = {"response_mime_type": response_mime_type}
+        response = client.models.generate_content(model=model_name, contents=prompt, **kwargs)
         return response.text
     except Exception as e:
         print(f"Warning: Gemini API call failed. {e}")
@@ -80,7 +83,7 @@ def triage_files(file_paths, model_name):
     prompt_template = _read_prompt_template("triage.md")
     prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
     
-    response = _call_gemini(prompt, model_name)
+    response = _call_gemini(prompt, model_name, response_mime_type="application/json")
     try:
         # Strip markdown code block formatting if present
         clean_response = response.strip().strip('`').removeprefix('json').strip()
