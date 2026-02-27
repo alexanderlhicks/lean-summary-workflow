@@ -243,8 +243,8 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
     summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
     
     summary += "\n---\n\n**Lean Declarations**\n\n"
-    if removed_decls: summary += f"<details><summary>✅ **Removed:** {len(removed_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed_decls) + "</details>\n"
-    if added_decls: summary += f"<details><summary>❌ **Added:** {len(added_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added_decls) + "</details>\n"
+    if removed_decls: summary += f"<details><summary>✏️ **Removed:** {len(removed_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed_decls) + "</details>\n"
+    if added_decls: summary += f"<details><summary>✏️ **Added:** {len(added_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added_decls) + "</details>\n"
     if affected_decls:
         summary += f"<details><summary>✏️ **Affected:** {len(affected_decls)} declaration(s) (line number changed)</summary>\n\n"
         for s in affected_decls: summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}\n"
