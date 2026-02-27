@@ -18,7 +18,7 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 2.  **Set up Python:** Configures the GitHub Actions environment with Python to run the summary script.
 3.  **Install Python Dependencies:** Installs necessary Python libraries defined in `requirements.txt`.
 4.  **Generate Diff:** Creates a `pr.diff` file containing the complete changes between the PR's head and base branches.
-5.  **Summarize Per-File Changes:** The `summary.py` script splits the `pr.diff` into individual file diffs. For each `.lean` file, it calls the Gemini API to generate a concise, one-sentence summary of its changes.
+5.  **Summarize Per-File Changes:** The `summary.py` script splits the `pr.diff` into individual file diffs. For each file, it calls the Gemini API to generate a concise, one-sentence summary of its changes.
 6.  **Perform Style Guide Check (Optional):** If a `style_guide_path` is provided, the script reads the content of that file and sends it along with the full PR diff to the Gemini API. The AI then reviews the changes against the style guide and reports any deviations.
 7.  **Analyze Diff for `sorry`s:** The script analyzes the `pr.diff` to identify and categorize `sorry`s that have been added, removed, or affected by line changes.
 8.  **Synthesize Overall Summary:** The individual file summaries, along with the PR title and body, are fed to the Gemini API to generate a comprehensive, high-level overview of the entire Pull Request.

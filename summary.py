@@ -211,8 +211,8 @@ def format_summary(ai_summary, stats, added, removed, affected, truncated, issue
     """Formats the final summary comment in Markdown."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
-    cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->"
-    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}\n\n{ai_summary}\n"
+    cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->\n\n" if cache else ""
+    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}{ai_summary}\n"
     if truncated: summary += "> *Note: The diff was too large and was truncated.*\n"
     summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
     summary += "\n---\n\n**`sorry` Tracking**\n\n"
@@ -233,7 +233,7 @@ def format_summary(ai_summary, stats, added, removed, affected, truncated, issue
 def find_sorry_issues(repo: Repository):
     """Finds all open issues with the 'proof wanted' label."""
     try:
-        return repo.get_issues(state="open", labels=["proof wanted"])
+        return list(repo.get_issues(state="open", labels=["proof wanted"]))
     except Exception as e:
         print(f"Warning: Could not fetch issues. {e}")
         return []
