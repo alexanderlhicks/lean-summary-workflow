@@ -18,12 +18,13 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 2.  **Set up Python:** Configures the GitHub Actions environment with Python to run the summary script.
 3.  **Install Python Dependencies:** Installs necessary Python libraries defined in `requirements.txt`.
 4.  **Generate Diff:** Creates a `pr.diff` file containing the complete changes between the PR's head and base branches.
-5.  **Summarize Per-File Changes:** The `summary.py` script splits the `pr.diff` into individual file diffs. For each file, it calls the Gemini API to generate a concise, one-sentence summary of its changes.
-6.  **Perform Style Guide Check (Optional):** If a `style_guide_path` is provided, the script reads the content of that file and sends it along with the full PR diff to the Gemini API. The AI then reviews the changes against the style guide and reports any deviations.
+5.  **Triage Files:** A Triage Agent reviews the list of changed files and filters out noise (e.g., lockfiles, auto-generated code) to save processing time and tokens.
+6.  **Parallel Summarization & Style Check:** The script splits the `pr.diff` into individual file diffs. For each relevant file, a Summarizer Agent concurrently generates a concise summary of its changes. If a `style_guide_path` is provided, a Style Checker Agent concurrently reviews the full diff against the guide.
 7.  **Analyze Diff for `sorry`s:** The script analyzes the `pr.diff` to identify and categorize `sorry`s that have been added, removed, or affected by line changes.
-8.  **Synthesize Overall Summary:** The individual file summaries, along with the PR title and body, are fed to the Gemini API to generate a comprehensive, high-level overview of the entire Pull Request.
-9.  **Post PR Comment:** The final structured summary, including change statistics, `sorry` tracking, style adherence report (if applicable), and per-file summaries, is posted as a comment on the Pull Request. If a previous summary comment exists, it will be updated.
-10. **Clean up:** The temporary `pr.diff` file is removed.
+8.  **Synthesize Overall Summary:** The Synthesis Agent takes the individual file summaries, along with the PR title and body, to generate a comprehensive draft overview.
+9.  **Refine Summary:** A Refiner Agent reviews the draft synthesis to ensure accuracy, brevity, and professional tone, producing the final PR summary.
+10. **Post PR Comment:** The final structured summary, including change statistics, `sorry` tracking, style adherence report (if applicable), and per-file summaries, is posted as a comment on the Pull Request. If a previous summary comment exists, it will be updated.
+11. **Clean up:** The temporary `pr.diff` file is removed.
 
 ## Usage
 
@@ -73,13 +74,15 @@ jobs:
 
 ## Customizing AI Prompts
 
-The intelligence and behavior of the AI summarizer are primarily governed by Markdown prompt templates stored in the `prompts/` directory within this action.
+The intelligence and behavior of the AI are primarily governed by Markdown prompt templates stored in the `prompts/` directory within this action.
 
+*   `triage.md`: Instructs the Triage Agent on which files to ignore (e.g., lockfiles).
 *   `summarize_file.md`: Contains the instructions for the AI when generating a concise summary for individual files.
-*   `synthesize_summary.md`: Guides the AI in generating the overall high-level summary from the per-file summaries.
 *   `check_style.md`: Provides the rules and context for the AI to check code changes against the specified style guide.
+*   `synthesize_summary.md`: Guides the AI in generating the draft high-level summary from the per-file summaries.
+*   `refine_summary.md`: Instructs the Refiner Agent to review and polish the draft synthesis.
 
-You can modify these `.md` files directly within your forked repository to fine-tune the AI's persona, summarization criteria, style checking rules, or desired output format. Placeholders like `` `{{FILE_PATH}}` ``, `` `{{FILE_DIFF}}` ``, `` `{{PR_TITLE}}` ``, `` `{{PR_BODY}}` ``, `` `{{PER_FILE_SUMMARIES}}` ``, `` `{{STYLE_GUIDE_CONTENT}}` ``, and `` `{{DIFF_CONTENT}}` `` are used to inject dynamic information into the prompts during runtime. Ensure these placeholders are kept intact if you wish the AI to receive the corresponding context.
+You can modify these `.md` files directly within your forked repository to fine-tune the AI's persona, summarization criteria, style checking rules, or desired output format. Placeholders like `` `{{FILE_LIST}}` ``, `` `{{FILE_PATH}}` ``, `` `{{FILE_DIFF}}` ``, `` `{{PR_TITLE}}` ``, `` `{{PR_BODY}}` ``, `` `{{PER_FILE_SUMMARIES}}` ``, `` `{{STYLE_GUIDE_CONTENT}}` ``, `` `{{DIFF_CONTENT}}` ``, and `` `{{DRAFT_SUMMARY}}` `` are used to inject dynamic information into the prompts during runtime. Ensure these placeholders are kept intact if you wish the AI to receive the corresponding context.
 
 ## License
 

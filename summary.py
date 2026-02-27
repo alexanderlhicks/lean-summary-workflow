@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import hashlib
+import concurrent.futures
 from datetime import datetime
 from google import genai
 from github import Github, Auth, GitCommit
@@ -68,6 +69,35 @@ def check_style_adherence(diff_content, style_guide_content, model_name):
     prompt_template = _read_prompt_template("check_style.md")
     prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
+    return _call_gemini(prompt, model_name)
+
+def triage_files(file_paths, model_name):
+    """Uses the AI to filter out noise files before summarization."""
+    if not file_paths:
+        return []
+    
+    file_list_str = "\n".join(file_paths)
+    prompt_template = _read_prompt_template("triage.md")
+    prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
+    
+    response = _call_gemini(prompt, model_name)
+    try:
+        # Strip markdown code block formatting if present
+        clean_response = response.strip().strip('`').removeprefix('json').strip()
+        filtered_files = json.loads(clean_response)
+        if isinstance(filtered_files, list):
+            return [f for f in filtered_files if f in file_paths]
+        return file_paths
+    except json.JSONDecodeError:
+        print("Warning: Triage agent returned invalid JSON. Proceeding with all files.")
+        return file_paths
+
+def refine_summary(draft_summary, pr_title, pr_body, model_name):
+    """Refines the final summary using the AI."""
+    prompt_template = _read_prompt_template("refine_summary.md")
+    prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
+                            .replace("{{PR_BODY}}", pr_body) \
+                            .replace("{{DRAFT_SUMMARY}}", draft_summary)
     return _call_gemini(prompt, model_name)
 
 # --- Diff Analysis ---
@@ -335,31 +365,60 @@ def main():
         except FileNotFoundError:
             print(f"Warning: Style guide file not found at {style_guide_path}")
 
-    style_report = check_style_adherence(diff, style_guide_content, model_name) if style_guide_content else None
-
     diff_by_file = split_diff_into_files(diff)
+    all_files = list(diff_by_file.keys())
+    files_to_summarize = triage_files(all_files, model_name) if all_files else []
+    print(f"Triage agent selected {len(files_to_summarize)}/{len(all_files)} files to summarize.")
+
     per_file_summaries = []
-    
     cache = SummaryCache(pr) if pr else None
-    
-    for fp, fd in diff_by_file.items():
-        file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
-        summary = cache.get(fp, file_diff_hash) if cache else None
-        
-        if summary:
-            print(f"Cache hit for {fp}")
-        else:
-            print(f"Cache miss for {fp}")
-            summary = summarize_file_diff(fp, fd, model_name).strip()
-            if cache:
-                cache.update(fp, file_diff_hash, summary)
-        
-        per_file_summaries.append(f"**{fp}**: {summary}")
+    style_report = None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        style_future = None
+        if style_guide_content:
+            style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name)
+
+        future_to_file = {}
+        for fp in files_to_summarize:
+            fd = diff_by_file[fp]
+            file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
+            summary = cache.get(fp, file_diff_hash) if cache else None
+            
+            if summary:
+                print(f"Cache hit for {fp}")
+                per_file_summaries.append(f"**{fp}**: {summary}")
+            else:
+                print(f"Cache miss for {fp}. Queuing summarization.")
+                future = executor.submit(summarize_file_diff, fp, fd, model_name)
+                future_to_file[future] = (fp, file_diff_hash)
+
+        for future in concurrent.futures.as_completed(future_to_file):
+            fp, file_diff_hash = future_to_file[future]
+            try:
+                summary = future.result().strip()
+                if cache:
+                    cache.update(fp, file_diff_hash, summary)
+                per_file_summaries.append(f"**{fp}**: {summary}")
+            except Exception as exc:
+                print(f"Warning: Summarization for {fp} generated an exception: {exc}")
+
+        if style_future:
+            try:
+                style_report = style_future.result()
+            except Exception as exc:
+                print(f"Warning: Style check generated an exception: {exc}")
 
     try:
-        ai_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body)
+        draft_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body)
     except Exception as e:
         raise RuntimeError(f"Error synthesizing final summary: {e}")
+
+    try:
+        ai_summary = refine_summary(draft_summary, pr_title, pr_body, model_name)
+    except Exception as e:
+        print(f"Warning: Refiner agent failed. Using draft summary. {e}")
+        ai_summary = draft_summary
 
     final_summary = format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache)
     
