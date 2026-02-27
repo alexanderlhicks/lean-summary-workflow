@@ -18,9 +18,9 @@ inputs:
     required: false
     default: 'gemini-3-flash-preview'
   lean_keywords:
-    description: 'Comma-separated list of keywords to track for sorries'
+    description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
     required: false
-    default: 'def,abbrev,example,theorem,opaque,lemma,instance'
+    default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom'
   style_guide_path:
     description: 'Optional: Path to a style guide file for adherence checking'
     required: false
