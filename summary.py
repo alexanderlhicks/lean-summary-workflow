@@ -4,31 +4,52 @@ import sys
 import json
 import hashlib
 import concurrent.futures
+import time
 from datetime import datetime
+from collections import defaultdict
 from google import genai
-from github import Github, Auth, GitCommit
+from github import Github, Auth
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
 # --- Constants ---
-MAX_DIFF_TOKENS = 1_500_000
+MAX_DIFF_CHARS = 1_500_000
 COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
 CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
+# --- Global Client ---
+_client = None
+
+def get_client():
+    global _client
+    if _client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            sys.exit("Error: GEMINI_API_KEY environment variable not set.")
+        _client = genai.Client(api_key=api_key)
+    return _client
+
 # --- AI Generation ---
 
-def _call_gemini(prompt, model_name, response_mime_type=None):
-    """A helper function to call the Gemini API and handle errors."""
-    try:
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        kwargs = {}
-        if response_mime_type:
-            kwargs["config"] = {"response_mime_type": response_mime_type}
-        response = client.models.generate_content(model=model_name, contents=prompt, **kwargs)
-        return response.text
-    except Exception as e:
-        print(f"Warning: Gemini API call failed. {e}")
-        return f"Error: {e}"
+def _call_gemini(prompt, model_name, response_mime_type=None, retries=3, backoff_factor=2):
+    """A helper function to call the Gemini API with retry logic."""
+    client = get_client()
+    kwargs = {}
+    if response_mime_type:
+        kwargs["config"] = {"response_mime_type": response_mime_type}
+    
+    for i in range(retries):
+        try:
+            response = client.models.generate_content(model=model_name, contents=prompt, **kwargs)
+            return response.text
+        except Exception as e:
+            if i == retries - 1:
+                print(f"Error: Gemini API call failed after {retries} attempts: {e}")
+                return None
+            wait_time = backoff_factor ** (i + 1)
+            print(f"Warning: Gemini API call failed ({e}). Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+    return None
 
 def _read_prompt_template(template_name: str) -> str:
     action_path = os.path.dirname(os.path.realpath(__file__))
@@ -42,17 +63,18 @@ def _read_prompt_template(template_name: str) -> str:
 def split_diff_into_files(diff_content):
     """Splits a full git diff into a dictionary of per-file diffs."""
     files = {}
-    file_diffs = re.split(r'(?=diff --git a/.+ b/.+)', diff_content)
+    file_diffs = re.split(r'^diff --git ', diff_content, flags=re.MULTILINE)
     for file_diff in file_diffs:
         if not file_diff.strip(): continue
-        match = re.search(r'diff --git a/(.+) b/(.+)', file_diff)
+        # Re-add the split marker
+        full_file_diff = "diff --git " + file_diff
+        match = re.search(r'^diff --git a/(.+) b/(.+)', full_file_diff, flags=re.MULTILINE)
         if match:
-            files[match.group(2)] = file_diff
+            files[match.group(2)] = full_file_diff
     return files
 
-def summarize_file_diff(file_path, file_diff, model_name):
+def summarize_file_diff(file_path, file_diff, model_name, prompt_template):
     """Generates a summary for a single file's diff (Map step)."""
-    prompt_template = _read_prompt_template("summarize_file.md")
     prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
     return _call_gemini(prompt, model_name)
 
@@ -63,36 +85,56 @@ def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body):
     prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{PER_FILE_SUMMARIES}}", summaries_text)
-    return _call_gemini(prompt, model_name)
+    result = _call_gemini(prompt, model_name)
+    if not result:
+        raise RuntimeError("Failed to synthesize PR summary from per-file summaries.")
+    return result
 
-def check_style_adherence(diff_content, style_guide_content, model_name):
+def check_style_adherence(diff_content, style_guide_content, model_name, prompt_template):
     """Checks the diff against a style guide."""
     if not style_guide_content:
         return None
-    prompt_template = _read_prompt_template("check_style.md")
     prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
     return _call_gemini(prompt, model_name)
 
-def triage_files(file_paths, model_name):
+def triage_files(file_paths, diff_by_file, model_name):
     """Uses the AI to filter out noise files before summarization."""
     if not file_paths:
         return []
     
-    file_list_str = "\n".join(file_paths)
+    file_list_with_counts = []
+    for fp in file_paths:
+        diff = diff_by_file[fp]
+        # Count lines starting with + or - (excluding the diff headers which start with +++ or ---)
+        added = sum(1 for line in diff.splitlines() if line.startswith('+') and not line.startswith('+++'))
+        removed = sum(1 for line in diff.splitlines() if line.startswith('-') and not line.startswith('---'))
+        file_list_with_counts.append(f"{fp} (+{added}/-{removed})")
+        
+    file_list_str = "\n".join(file_list_with_counts)
     prompt_template = _read_prompt_template("triage.md")
     prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
     
     response = _call_gemini(prompt, model_name, response_mime_type="application/json")
+    if not response:
+        print("Warning: Triage agent failed. Proceeding with all files.")
+        return file_paths
     try:
         # Strip markdown code block formatting if present
-        clean_response = response.strip().strip('`').removeprefix('json').strip()
+        clean_response = response.strip()
+        if clean_response.startswith("```"):
+            lines = clean_response.splitlines()
+            if len(lines) > 2:
+                clean_response = "\n".join(lines[1:-1])
+            else:
+                clean_response = clean_response.strip("`").removeprefix("json").strip()
+
         filtered_files = json.loads(clean_response)
         if isinstance(filtered_files, list):
             return [f for f in filtered_files if f in file_paths]
         return file_paths
     except json.JSONDecodeError:
-        print("Warning: Triage agent returned invalid JSON. Proceeding with all files.")
+        print(f"Warning: Triage agent returned invalid JSON: {response}. Proceeding with all files.")
         return file_paths
 
 def refine_summary(draft_summary, pr_title, pr_body, model_name):
@@ -101,7 +143,11 @@ def refine_summary(draft_summary, pr_title, pr_body, model_name):
     prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{DRAFT_SUMMARY}}", draft_summary)
-    return _call_gemini(prompt, model_name)
+    result = _call_gemini(prompt, model_name)
+    if not result:
+        print("Warning: Refiner agent failed. Falling back to draft summary.")
+        return draft_summary
+    return result
 
 # --- Diff Analysis ---
 class DiffAnalyzer:
@@ -145,10 +191,19 @@ class DiffAnalyzer:
             if line.startswith("---") or line.startswith("+++"):
                 continue
 
-            if not self._current_file.endswith(".lean"):
-                continue
+            # Stats are now collected for ALL files
+            if line.startswith('+'):
+                self.lines_added += 1
+            elif line.startswith('-'):
+                self.lines_removed += 1
 
-            self._process_line(line)
+            # Lean-specific analysis
+            if self._current_file.endswith(".lean"):
+                self._process_line(line)
+            else:
+                # Still need to increment line numbers for non-Lean files 
+                # if we were tracking something in them, but we aren't.
+                pass
 
         self._categorize_sorries()
         self._categorize_decls()
@@ -181,26 +236,32 @@ class DiffAnalyzer:
         return False
 
     def _process_line(self, line):
-        if line.startswith('+'):
-            self.lines_added += 1
-        elif line.startswith('-'):
-            self.lines_removed += 1
-        self._track_sorries(line)
+        self._track_sorries_and_decls(line)
         if line.startswith('+'): self._new_line_num += 1
         elif line.startswith('-'): self._old_line_num += 1
         else:
             self._old_line_num += 1
             self._new_line_num += 1
 
-    def _track_sorries(self, line):
-        stripped_line = line.lstrip('+- ')
-        if any(stripped_line.startswith(keyword + ' ') for keyword in self._decl_keywords):
-            self._current_decl_header = re.sub(r"^[+-]\s*", "", line)
+    def _track_sorries_and_decls(self, line):
+        # Strip diff markers and leading whitespace
+        content = line[1:] if line.startswith(('+', '-', ' ')) else line
+        stripped_content = content.lstrip()
+        
+        # Track declarations
+        if any(stripped_content.startswith(keyword + ' ') for keyword in self._decl_keywords):
+            self._current_decl_header = stripped_content
             name_match = self._name_extract_regex.match(self._current_decl_header)
             if name_match:
                 self._current_decl_name = name_match.group(1)
+                # Use name + file as ID for categorization, but we might have multiple sorries
                 stable_id = f"{self._current_decl_name}@{self._current_file}"
-                decl_info = {'id': stable_id, 'file': self._current_file, 'name': self._current_decl_name, 'header': self._current_decl_header.split(":=")[0].strip()}
+                decl_info = {
+                    'id': stable_id, 
+                    'file': self._current_file, 
+                    'name': self._current_decl_name, 
+                    'header': self._current_decl_header.split(":=")[0].strip()
+                }
                 if line.startswith('+'):
                     decl_info['line'] = self._new_line_num
                     self._raw_added_decls[stable_id] = decl_info
@@ -208,18 +269,31 @@ class DiffAnalyzer:
                     decl_info['line'] = self._old_line_num
                     self._raw_removed_decls[stable_id] = decl_info
 
-        if 'sorry' in line and self._current_decl_name:
-            comment_pos = line.find("--")
-            sorry_pos = line.find("sorry")
-            if comment_pos != -1 and sorry_pos > comment_pos: return
+        # Track sorries
+        if 'sorry' in content and self._current_decl_name:
+            # Improved comment detection: -- must be at start of line or preceded by whitespace
+            comment_match = re.search(r'(?:^|\s)--', content)
+            sorry_pos = content.find("sorry")
+            if comment_match and sorry_pos > comment_match.start():
+                return
+            
             stable_id = f"{self._current_decl_name}@{self._current_file}"
-            sorry_info = {'id': stable_id, 'file': self._current_file, 'name': self._current_decl_name, 'header': self._current_decl_header.split(":=")[0].strip()}
+            # Unique key for each sorry instance to avoid overwriting
+            line_num = self._new_line_num if line.startswith('+') else self._old_line_num
+            instance_key = f"{stable_id}#L{line_num}"
+            
+            sorry_info = {
+                'id': stable_id, 
+                'file': self._current_file, 
+                'name': self._current_decl_name, 
+                'header': self._current_decl_header.split(":=")[0].strip() if self._current_decl_header else "unknown"
+            }
             if line.startswith('+'):
                 sorry_info['line'] = self._new_line_num
-                self._raw_added[stable_id] = sorry_info
+                self._raw_added[instance_key] = sorry_info
             elif line.startswith('-'):
                 sorry_info['line'] = self._old_line_num
-                self._raw_removed[stable_id] = sorry_info
+                self._raw_removed[instance_key] = sorry_info
     
     def _categorize_decls(self):
         added_ids, removed_ids = set(self._raw_added_decls.keys()), set(self._raw_removed_decls.keys())
@@ -232,11 +306,43 @@ class DiffAnalyzer:
             self.removed_decls.append(f"`{self._raw_removed_decls[sid]['header']}` in `{self._raw_removed_decls[sid]['file']}`")
 
     def _categorize_sorries(self):
-        added_ids, removed_ids = set(self._raw_added.keys()), set(self._raw_removed.keys())
-        affected_ids = added_ids.intersection(removed_ids)
-        for sid in affected_ids: self.affected_sorries.append({'id': sid, 'file': self._raw_added[sid]['file'], 'context': self._raw_added[sid]['header'], 'old_line': self._raw_removed[sid]['line'], 'new_line': self._raw_added[sid]['line']})
-        for sid in added_ids - affected_ids: self.added_sorries.append(f"`{self._raw_added[sid]['header']}` in `{self._raw_added[sid]['file']}`")
-        for sid in removed_ids - affected_ids: self.removed_sorries.append(f"`{self._raw_removed[sid]['header']}` in `{self._raw_removed[sid]['file']}`")
+        added_by_id = defaultdict(list)
+        removed_by_id = defaultdict(list)
+        
+        for info in self._raw_added.values():
+            added_by_id[info['id']].append(info)
+            
+        for info in self._raw_removed.values():
+            removed_by_id[info['id']].append(info)
+            
+        all_ids = set(added_by_id.keys()).union(removed_by_id.keys())
+        
+        for sid in all_ids:
+            adds = added_by_id[sid]
+            rems = removed_by_id[sid]
+            
+            # Match up to min(len(adds), len(rems)) as "affected"
+            match_count = min(len(adds), len(rems))
+            
+            for i in range(match_count):
+                added_info = adds[i]
+                removed_info = rems[i]
+                self.affected_sorries.append({
+                    'id': added_info['id'], 
+                    'file': added_info['file'], 
+                    'context': added_info['header'], 
+                    'old_line': removed_info['line'], 
+                    'new_line': added_info['line']
+                })
+                
+            # Remaining are purely added or removed
+            for i in range(match_count, len(adds)):
+                info = adds[i]
+                self.added_sorries.append(f"`{info['header']}` in `{info['file']}` (L{info['line']})")
+                
+            for i in range(match_count, len(rems)):
+                info = rems[i]
+                self.removed_sorries.append(f"`{info['header']}` in `{info['file']}` (L{info['line']})")
 
 # --- Caching ---
 class SummaryCache:
@@ -266,37 +372,69 @@ class SummaryCache:
         return json.dumps(self._cache)
 
 # --- Comment Formatting ---
+
+def _format_stats_section(stats):
+    return (
+        "\n---\n\n**Statistics**\n\n"
+        "| Metric | Count |\n"
+        "| --- | --- |\n"
+        f"| 📝 **Files Changed** | {stats['files_changed']} |\n"
+        f"| ✅ **Lines Added** | {stats['lines_added']} |\n"
+        f"| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
+    )
+
+def _format_decls_section(added, removed, affected):
+    res = "\n---\n\n**Lean Declarations**\n\n"
+    if removed:
+        res += f"<details><summary>✏️ **Removed:** {len(removed)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+    if added:
+        res += f"<details><summary>✏️ **Added:** {len(added)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+    if affected:
+        res += f"<details><summary>✏️ **Affected:** {len(affected)} declaration(s) (line number changed)</summary>\n\n"
+        for s in affected:
+            res += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}\n"
+        res += "</details>\n"
+    if not any([added, removed, affected]):
+        res += "*   No declarations were added, removed, or affected.\n"
+    return res
+
+def _format_sorry_section(added, removed, affected, issues):
+    res = "\n---\n\n**`sorry` Tracking**\n\n"
+    if removed:
+        res += f"<details><summary>✅ **Removed:** {len(removed)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+    if added:
+        res += f"<details><summary>❌ **Added:** {len(added)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+    if affected:
+        res += f"<details><summary>✏️ **Affected:** {len(affected)} `sorry`(s) (line number changed)</summary>\n\n"
+        for s in affected:
+            issue_link = next((f" (Issue #{issue.number})" for issue in issues if issue.body and f"<!-- sorry-tracker-id: {s['id']} -->" in issue.body), "")
+            res += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}{issue_link}\n"
+        res += "</details>\n"
+    if not any([added, removed, affected]):
+        res += "*   No `sorry`s were added, removed, or affected.\n"
+    return res
+
 def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache):
     """Formats the final summary comment in Markdown."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
     cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->\n\n" if cache else ""
+    
     summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}{ai_summary}\n"
-    if truncated: summary += "> *Note: The diff was too large and was truncated.*\n"
-    summary += f"\n---\n\n**Analysis of Changes**\n\n| Metric | Count |\n| --- | --- |\n| 📝 **Files Changed** | {stats['files_changed']} |\n| ✅ **Lines Added** | {stats['lines_added']} |\n| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
     
-    summary += "\n---\n\n**Lean Declarations**\n\n"
-    if removed_decls: summary += f"<details><summary>✏️ **Removed:** {len(removed_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed_decls) + "</details>\n"
-    if added_decls: summary += f"<details><summary>✏️ **Added:** {len(added_decls)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added_decls) + "</details>\n"
-    if affected_decls:
-        summary += f"<details><summary>✏️ **Affected:** {len(affected_decls)} declaration(s) (line number changed)</summary>\n\n"
-        for s in affected_decls: summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}\n"
-        summary += "</details>\n"
-    if not any([added_decls, removed_decls, affected_decls]): summary += "*   No declarations were added, removed, or affected.\n"
-
-    summary += "\n---\n\n**`sorry` Tracking**\n\n"
-    if removed: summary += f"<details><summary>✅ **Removed:** {len(removed)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
-    if added: summary += f"<details><summary>❌ **Added:** {len(added)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
-    if affected:
-        summary += f"<details><summary>✏️ **Affected:** {len(affected)} `sorry`(s) (line number changed)</summary>\n\n"
-        for s in affected:
-            issue_link = next((f" (Issue #{issue.number})" for issue in issues if issue.body and f"<!-- sorry-tracker-id: {s['id']} -->" in issue.body), "")
-            summary += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}{issue_link}\n"
-        summary += "</details>\n"
-    if not any([added, removed, affected]): summary += "*   No `sorry`s were added, removed, or affected.\n"
+    if truncated:
+        summary += "> *Note: The diff was too large and was truncated.*\n"
     
-    if style_report: summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
-    if per_file_summaries: summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in per_file_summaries) + "</details>\n"
+    summary += _format_stats_section(stats)
+    summary += _format_decls_section(added_decls, removed_decls, affected_decls)
+    summary += _format_sorry_section(added, removed, affected, issues)
+    
+    if style_report:
+        summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
+    
+    if per_file_summaries:
+        summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in per_file_summaries) + "</details>\n"
+    
     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
 
@@ -335,9 +473,8 @@ def post_github_comment(pr: PullRequest, summary: str):
 # --- Main Execution ---
 def main():
     """Main execution block."""
-    if "GEMINI_API_KEY" not in os.environ:
-        sys.exit("Error: GEMINI_API_KEY environment variable not set.")
-
+    # Ensure client can be initialized (checks API key)
+    get_client()
 
     model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-flash-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
@@ -354,11 +491,14 @@ def main():
 
     repo, pr, issues, pr_title, pr_body = None, None, [], "", ""
     if "GITHUB_TOKEN" in os.environ:
-        repo, pr = get_github_objects(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], int(os.environ["PR_NUMBER"]))
-        issues, pr_title, pr_body = find_sorry_issues(repo), pr.title, pr.body or ""
+        try:
+            repo, pr = get_github_objects(os.environ["GITHUB_TOKEN"], os.environ["GITHUB_REPOSITORY"], int(os.environ["PR_NUMBER"]))
+            issues, pr_title, pr_body = find_sorry_issues(repo), pr.title, pr.body or ""
+        except Exception as e:
+            print(f"Warning: Could not fetch GitHub info: {e}")
 
-    truncated = len(diff) > MAX_DIFF_TOKENS
-    if truncated: diff = diff[:MAX_DIFF_TOKENS]
+    truncated = len(diff) > MAX_DIFF_CHARS
+    if truncated: diff = diff[:MAX_DIFF_CHARS]
 
     style_guide_content = ""
     if style_guide_path:
@@ -370,17 +510,20 @@ def main():
 
     diff_by_file = split_diff_into_files(diff)
     all_files = list(diff_by_file.keys())
-    files_to_summarize = triage_files(all_files, model_name) if all_files else []
+    files_to_summarize = triage_files(all_files, diff_by_file, model_name) if all_files else []
     print(f"Triage agent selected {len(files_to_summarize)}/{len(all_files)} files to summarize.")
 
     per_file_summaries = []
     cache = SummaryCache(pr) if pr else None
     style_report = None
+    
+    summarize_template = _read_prompt_template("summarize_file.md")
+    style_template = _read_prompt_template("check_style.md") if style_guide_content else ""
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         style_future = None
         if style_guide_content:
-            style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name)
+            style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name, style_template)
 
         future_to_file = {}
         for fp in files_to_summarize:
@@ -393,16 +536,20 @@ def main():
                 per_file_summaries.append(f"**{fp}**: {summary}")
             else:
                 print(f"Cache miss for {fp}. Queuing summarization.")
-                future = executor.submit(summarize_file_diff, fp, fd, model_name)
+                future = executor.submit(summarize_file_diff, fp, fd, model_name, summarize_template)
                 future_to_file[future] = (fp, file_diff_hash)
 
         for future in concurrent.futures.as_completed(future_to_file):
             fp, file_diff_hash = future_to_file[future]
             try:
-                summary = future.result().strip()
-                if cache:
-                    cache.update(fp, file_diff_hash, summary)
-                per_file_summaries.append(f"**{fp}**: {summary}")
+                res = future.result()
+                if res:
+                    summary = res.strip()
+                    if cache:
+                        cache.update(fp, file_diff_hash, summary)
+                    per_file_summaries.append(f"**{fp}**: {summary}")
+                else:
+                    print(f"Warning: Summarization for {fp} failed.")
             except Exception as exc:
                 print(f"Warning: Summarization for {fp} generated an exception: {exc}")
 
@@ -415,7 +562,9 @@ def main():
     try:
         draft_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body)
     except Exception as e:
-        raise RuntimeError(f"Error synthesizing final summary: {e}")
+        print(f"Error synthesizing final summary: {e}")
+        # Create a fallback summary if synthesis fails
+        draft_summary = "Failed to generate AI summary. Please check the per-file summaries and statistics below."
 
     try:
         ai_summary = refine_summary(draft_summary, pr_title, pr_body, model_name)

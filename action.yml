@@ -29,7 +29,7 @@ runs:
   using: "composite"
   steps:
     - name: Checkout PR Code
-      uses: actions/checkout@v6.0.1
+      uses: actions/checkout@v6.0.2
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0 # Fetch all history to enable diffing against base
@@ -39,7 +39,7 @@ runs:
       shell: bash
 
     - name: Set up Python
-      uses: actions/setup-python@v6.1.0
+      uses: actions/setup-python@v6.2.0
       with:
         python-version: '3.13'
         cache: 'pip'
@@ -66,7 +66,8 @@ runs:
       shell: bash
 
     - name: Clean up artifacts
+      if: always()
       run: |
-        rm pr.diff
-        rm ./action-requirements.txt
+        rm -f pr.diff
+        rm -f ./action-requirements.txt
       shell: bash
