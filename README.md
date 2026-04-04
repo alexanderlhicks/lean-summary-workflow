@@ -9,8 +9,11 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 *   **Multi-Agent Orchestration:** Employs a pipeline of specialized AI agents (Triage, Summarizer, Synthesizer, Refiner) to ensure high-quality, professional summaries.
 *   **High Performance:** Utilizes asynchronous, parallel execution to summarize multiple files simultaneously, drastically reducing the time required for large pull requests.
 *   **Smart Triage:** Automatically filters out noise (lockfiles, binaries, generated code) to focus the summary on meaningful changes and save on token costs.
-*   **Lean-Aware Analysis:** Tracks `sorry` usages and declaration changes in Lean files, and identifies citations of academic literature or reference materials.
+*   **Lean-Aware Analysis:** Tracks `sorry` usages and declaration changes in Lean files. Displays a top-level sorry delta showing net proof progress. Warns on `admit`, `native_decide`, debug commands (`#check`/`#eval`), and `set_option autoImplicit true`.
+*   **Large-PR Scaling:** For PRs with many files, automatically switches to tiered triage (high/low priority) and two-stage synthesis (per-directory then global) to stay within model context limits.
 *   **Optional Style Guide Adherence Check:** Automatically reviews code changes against a specified style guide (e.g., `CONTRIBUTING.md`) to ensure consistency.
+*   **Optional PR Title Validation:** Validates PR titles against conventional commit format (`type[(scope)]: subject`) and uses the parsed type to inform summary structure.
+*   **Upstream Path Reminders:** Flags when changed files fall under a configurable path prefix (e.g., `ToMathlib/`) and reminds about upstream PRs.
 *   **Customizable AI Prompts:** The behavior and persona of each agent can be easily tailored by modifying external Markdown prompt files.
 
 
@@ -20,9 +23,9 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 2.  **Set up Python:** Configures the GitHub Actions environment with Python to run the summary script.
 3.  **Install Python Dependencies:** Installs necessary Python libraries defined in `requirements.txt`.
 4.  **Generate Diff:** Creates a `pr.diff` file containing the complete changes between the PR's head and base branches.
-5.  **Triage Files:** A Triage Agent reviews the list of changed files and filters out noise (e.g., lockfiles, auto-generated code) to save processing time and tokens.
+5.  **Triage Files:** A Triage Agent reviews the list of changed files and filters out noise (e.g., lockfiles, auto-generated code) to save processing time and tokens. For large PRs (50+ files), the agent assigns priority tiers; files with proof-relevant signals (`sorry`, `admit`, `native_decide`) are always high priority.
 6.  **Parallel Summarization & Style Check:** The script splits the `pr.diff` into individual file diffs. For each relevant file, a Summarizer Agent concurrently generates a concise summary of its changes. If a `style_guide_path` is provided, a Style Checker Agent concurrently reviews the full diff against the guide.
-7.  **Analyze Diff for `sorry`s:** The script analyzes the `pr.diff` to identify and categorize `sorry`s that have been added, removed, or affected by line changes.
+7.  **Analyze Diff for `sorry`s and Quality Signals:** The script analyzes the `pr.diff` to identify and categorize `sorry`s that have been added, removed, or affected by line changes. It also detects `admit`, `native_decide`, debug commands, and `autoImplicit` re-enablement in added Lean lines.
 8.  **Synthesize Overall Summary:** The Synthesis Agent takes the individual file summaries, along with the PR title and body, to generate a comprehensive draft overview.
 9.  **Refine Summary:** A Refiner Agent reviews the draft synthesis to ensure accuracy, brevity, and professional tone, producing the final PR summary.
 10. **Post PR Comment:** The final structured summary, including change statistics, `sorry` tracking, style adherence report (if applicable), and per-file summaries, is posted as a comment on the Pull Request. If a previous summary comment exists, it will be updated.
@@ -62,6 +65,38 @@ jobs:
           # lean_keywords: 'def,lemma'
 ```
 
+> **Note on forked PRs:** The `pull_request` event does not expose repository secrets to workflows triggered by forks, and the `GITHUB_TOKEN` it provides is read-only. This means the above workflow will fail for PRs from external contributors. If your repository accepts fork PRs, use `pull_request_target` instead — but be aware that `pull_request_target` runs in the context of the base branch, so you must take care not to execute untrusted code from the fork.
+
+<details><summary>Example workflow for public repositories accepting fork PRs</summary>
+
+```yaml
+name: 'PR Summary'
+
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate PR Summary
+        uses: your-org/your-repo-name@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          github_repository: ${{ github.repository }}
+          pr_number: ${{ github.event.pull_request.number }}
+```
+
+This is safe for this action because it only reads the diff and posts a comment — it does not execute any code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch.
+
+</details>
+
 ## Inputs
 
 | Input | Description | Required | Default |
@@ -73,12 +108,15 @@ jobs:
 | `gemini_model` | The Gemini model to use for the summary. | `false` | `gemini-3-flash-preview` |
 | `lean_keywords`| A comma-separated list of keywords to track for `sorry`s in `.lean` files. | `false` | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
 | `style_guide_path`| Optional: Path to a style guide file within the repository for adherence checking. | `false` | `CONTRIBUTING.md` |
+| `validate_title` | Validate PR title against conventional commit format: `type[(scope)]: subject`. | `false` | `false` |
+| `upstream_path` | Path prefix for upstream-bound files. If changed files match, a reminder is shown. | `false` | |
 
 ## Customizing AI Prompts
 
 The intelligence and behavior of the AI are primarily governed by Markdown prompt templates stored in the `prompts/` directory within this action.
 
 *   `triage.md`: Instructs the Triage Agent on which files to ignore (e.g., lockfiles).
+*   `triage_tiered.md`: Used for large PRs (50+ files). Classifies files into high/low priority tiers with conservative defaults.
 *   `summarize_file.md`: Contains the instructions for the AI when generating a concise summary for individual files.
 *   `check_style.md`: Provides the rules and context for the AI to check code changes against the specified style guide.
 *   `synthesize_summary.md`: Guides the AI in generating the draft high-level summary from the per-file summaries.

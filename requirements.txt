@@ -1,2 +1,2 @@
-google-genai
-PyGithub
+google-genai>=1.0,<2.0
+PyGithub>=2.0,<3.0
