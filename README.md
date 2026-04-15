@@ -1,6 +1,6 @@
 # PR Summary Action
 
-This GitHub Action generates a concise, high-level summary for a pull request using the Google Gemini API. It analyzes the PR's title, body, and git diff to produce a structured summary, and includes special features for analyzing [Lean](https://lean-lang.org/) projects.
+This GitHub Action generates a concise, high-level summary for a pull request using an LLM API (Gemini, Anthropic Claude, or OpenAI GPT). It analyzes the PR's title, body, and git diff to produce a structured summary, and includes special features for analyzing [Lean](https://lean-lang.org/) projects.
 
 For pull requests with multiple file changes, the action employs a hierarchical approach: it first generates a summary for each individual file's changes and then synthesizes these into a comprehensive, high-level overview of the entire pull request. This ensures that even complex changes are accurately and clearly summarized.
 
@@ -54,15 +54,13 @@ jobs:
         uses: your-org/your-repo-name@main # Replace with your action's repository
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          provider: gemini  # or: anthropic, openai
+          model: gemini-3-flash-preview  # or: claude-sonnet-4-20250514, gpt-4o-mini
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
           # Optional: Path to a style guide file (defaults to 'CONTRIBUTING.md')
           # style_guide_path: 'docs/my-style-guide.md'
-          # Optional: Specify a different Gemini model (default: 'gemini-3-flash-preview')
-          # gemini_model: "gemini-3-flash-preview"
-          # Optional: Comma-separated list of keywords to track for sorrys (default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom')
-          # lean_keywords: 'def,lemma'
 ```
 
 > **Note on forked PRs:** The `pull_request` event does not expose repository secrets to workflows triggered by forks, and the `GITHUB_TOKEN` it provides is read-only. This means the above workflow will fail for PRs from external contributors. If your repository accepts fork PRs, use `pull_request_target` instead — but be aware that `pull_request_target` runs in the context of the base branch, so you must take care not to execute untrusted code from the fork.
@@ -88,7 +86,9 @@ jobs:
         uses: your-org/your-repo-name@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          provider: gemini
+          model: gemini-3-flash-preview
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
 ```
@@ -102,10 +102,11 @@ This is safe for this action because it only reads the diff and posts a comment 
 | Input | Description | Required | Default |
 |---|---|---|---|
 | `github_token` | The GitHub token for API calls. Should be set to `${{ secrets.GITHUB_TOKEN }}`. | `true` | |
-| `gemini_api_key` | The API key for the Gemini API, used for summary generation. Store this as a secret in your repository. | `true` | |
+| `api_key` | API key for the LLM provider. Store this as a secret in your repository. | `true` | |
+| `provider` | LLM provider: `gemini`, `anthropic`, or `openai`. | `false` | `gemini` |
 | `github_repository` | The GitHub repository in the format `owner/repo`. Should be set to `${{ github.repository }}`. | `true` | |
 | `pr_number` | The pull request number. Should be set to `${{ github.event.pull_request.number }}`. | `true` | |
-| `gemini_model` | The Gemini model to use for the summary. | `false` | `gemini-3-flash-preview` |
+| `model` | The LLM model to use (e.g., `gemini-3-flash-preview`, `claude-sonnet-4-20250514`, `gpt-4o-mini`). | `true` | |
 | `lean_keywords`| A comma-separated list of keywords to track for `sorry`s in `.lean` files. | `false` | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
 | `style_guide_path`| Optional: Path to a style guide file within the repository for adherence checking. | `false` | `CONTRIBUTING.md` |
 | `validate_title` | Validate PR title against conventional commit format: `type[(scope)]: subject`. | `false` | `false` |

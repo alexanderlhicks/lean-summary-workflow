@@ -4,19 +4,22 @@ inputs:
   github_token:
     description: 'GitHub Token for API calls'
     required: true
-  gemini_api_key:
-    description: 'Gemini API Key for AI summary generation'
+  api_key:
+    description: 'API key for the LLM provider'
     required: true
+  provider:
+    description: 'LLM provider to use: gemini, anthropic, or openai'
+    required: false
+    default: 'gemini'
   github_repository:
     description: 'The GitHub repository (e.g., owner/repo)'
     required: true
   pr_number:
     description: 'The Pull Request number'
     required: true
-  gemini_model:
-    description: 'The Gemini model to use for the summary'
-    required: false
-    default: 'gemini-3-flash-preview'
+  model:
+    description: 'The LLM model to use (e.g., gemini-3-flash-preview, claude-sonnet-4-20250514, gpt-4o)'
+    required: true
   lean_keywords:
     description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
     required: false
@@ -44,7 +47,7 @@ runs:
 
     - name: Mask secrets
       run: |
-        echo "::add-mask::${{ inputs.gemini_api_key }}"
+        echo "::add-mask::${{ inputs.api_key }}"
         echo "::add-mask::${{ inputs.github_token }}"
       shell: bash
 
@@ -72,10 +75,11 @@ runs:
     - name: Generate summary
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
-        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        API_KEY: ${{ inputs.api_key }}
+        PROVIDER: ${{ inputs.provider }}
         GITHUB_REPOSITORY: ${{ inputs.github_repository }}
         PR_NUMBER: ${{ inputs.pr_number }}
-        INPUT_GEMINI_MODEL: ${{ inputs.gemini_model }}
+        INPUT_MODEL: ${{ inputs.model }}
         INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
         INPUT_STYLE_GUIDE_PATH: ${{ inputs.style_guide_path }}
         INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}

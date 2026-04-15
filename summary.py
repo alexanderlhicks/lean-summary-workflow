@@ -4,14 +4,19 @@ import sys
 import json
 import hashlib
 import concurrent.futures
+import logging
 import threading
 import time
 from datetime import datetime
 from collections import defaultdict
-from google import genai
 from github import Github, Auth
 from github.PullRequest import PullRequest
 from github.Repository import Repository
+
+from lean_utils import is_in_comment
+from llm_provider import LLMProvider, TokenUsage, create_provider
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Constants ---
 MAX_DIFF_CHARS = 1_500_000
@@ -20,41 +25,48 @@ LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage sy
 COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
 CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
-# --- Global Client and Rate Limiter ---
-_client = None
-_api_semaphore = threading.Semaphore(5)  # Cap concurrent Gemini API calls
+# --- Global Provider and Token Tracker ---
+_provider: LLMProvider = None  # Initialized in main()
 
-def get_client():
-    global _client
-    if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            sys.exit("Error: GEMINI_API_KEY environment variable not set.")
-        _client = genai.Client(api_key=api_key)
-    return _client
+
+class TokenTracker:
+    """Thread-safe cumulative token usage tracker."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_input = 0
+        self.total_output = 0
+        self.total_thinking = 0
+        self.call_count = 0
+
+    def record(self, usage: TokenUsage):
+        with self._lock:
+            self.call_count += 1
+            self.total_input += usage.input_tokens
+            self.total_output += usage.output_tokens
+            self.total_thinking += usage.thinking_tokens
+
+    def summary(self) -> str:
+        with self._lock:
+            total = self.total_input + self.total_output + self.total_thinking
+            parts = [f"Token usage: {self.total_input:,} input + {self.total_output:,} output"]
+            if self.total_thinking > 0:
+                parts.append(f" + {self.total_thinking:,} thinking")
+            parts.append(f" = {total:,} total across {self.call_count} API calls")
+            return "".join(parts)
+
+token_tracker = TokenTracker()
+
 
 # --- AI Generation ---
 
-def _call_gemini(prompt, model_name, response_mime_type=None, retries=3, backoff_factor=2):
-    """A helper function to call the Gemini API with retry logic and rate limiting."""
-    client = get_client()
-    kwargs = {}
-    if response_mime_type:
-        kwargs["config"] = {"response_mime_type": response_mime_type}
-
-    with _api_semaphore:
-        for i in range(retries):
-            try:
-                response = client.models.generate_content(model=model_name, contents=prompt, **kwargs)
-                return response.text
-            except Exception as e:
-                if i == retries - 1:
-                    print(f"Error: Gemini API call failed after {retries} attempts: {e}")
-                    return None
-                wait_time = backoff_factor ** (i + 1)
-                print(f"Warning: Gemini API call failed ({e}). Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-    return None
+def _call_llm(prompt, model_name, json_mode=False):
+    """Calls the LLM provider with retry logic and token tracking."""
+    if json_mode:
+        text, usage = _provider.generate_json(model_name, prompt)
+    else:
+        text, usage = _provider.generate_text(model_name, prompt)
+    token_tracker.record(usage)
+    return text
 
 def _read_prompt_template(template_name: str) -> str:
     action_path = os.path.dirname(os.path.realpath(__file__))
@@ -81,7 +93,7 @@ def split_diff_into_files(diff_content):
 def summarize_file_diff(file_path, file_diff, model_name, prompt_template):
     """Generates a summary for a single file's diff (Map step)."""
     prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
-    return _call_gemini(prompt, model_name)
+    return _call_llm(prompt, model_name)
 
 def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint=""):
     """Synthesizes a final summary from per-file summaries (Reduce step)."""
@@ -91,7 +103,7 @@ def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_typ
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{PER_FILE_SUMMARIES}}", summaries_text) \
                             .replace("{{PR_TYPE_HINT}}", pr_type_hint)
-    result = _call_gemini(prompt, model_name)
+    result = _call_llm(prompt, model_name)
     if not result:
         raise RuntimeError("Failed to synthesize PR summary from per-file summaries.")
     return result
@@ -102,7 +114,7 @@ def check_style_adherence(diff_content, style_guide_content, model_name, prompt_
         return None
     prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
-    return _call_gemini(prompt, model_name)
+    return _call_llm(prompt, model_name)
 
 _PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
 
@@ -159,7 +171,7 @@ def triage_files(file_paths, diff_by_file, model_name):
         prompt_template = _read_prompt_template("triage.md")
     prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
 
-    response = _call_gemini(prompt, model_name, response_mime_type="application/json")
+    response = _call_llm(prompt, model_name, json_mode=True)
     if not response:
         print("Warning: Triage agent failed. Proceeding with all files.")
         return file_paths, []
@@ -215,7 +227,7 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
                                     .replace("{{PR_BODY}}", "") \
                                     .replace("{{PER_FILE_SUMMARIES}}", group_text) \
                                     .replace("{{PR_TYPE_HINT}}", f"This is a sub-summary for the `{group_key}/` directory. ")
-            result = _call_gemini(prompt, model_name)
+            result = _call_llm(prompt, model_name)
             if result:
                 group_summaries.append(f"**{group_key}/**: {result.strip()}")
             else:
@@ -230,7 +242,7 @@ def refine_summary(draft_summary, pr_title, pr_body, model_name):
     prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{DRAFT_SUMMARY}}", draft_summary)
-    result = _call_gemini(prompt, model_name)
+    result = _call_llm(prompt, model_name)
     if not result:
         print("Warning: Refiner agent failed. Falling back to draft summary.")
         return draft_summary
@@ -256,6 +268,7 @@ class DiffAnalyzer:
         self._current_file = ""
         self._old_line_num = 0
         self._new_line_num = 0
+        self._comment_depth = 0  # Lean nested block comment depth
         self._current_decl_header = ""
         self._current_decl_name = ""
         self._raw_added = {}
@@ -308,6 +321,7 @@ class DiffAnalyzer:
         if match:
             self._current_file = match.group(2)
             self.files_changed.add(self._current_file)
+            self._comment_depth = 0
             self._current_decl_header = ""
             self._current_decl_name = ""
             return True
@@ -333,9 +347,16 @@ class DiffAnalyzer:
     ]
 
     def _process_line(self, line):
-        self._track_sorries_and_decls(line)
+        # Strip diff marker to get the actual source line for comment detection
+        content_line = line[1:] if line.startswith(('+', '-')) else line
+        in_comment, self._comment_depth = is_in_comment(content_line, self._comment_depth)
+
+        if not in_comment:
+            self._track_sorries_and_decls(line)
+            if line.startswith('+'):
+                self._check_quality_signals(line)
+
         if line.startswith('+'):
-            self._check_quality_signals(line)
             self._new_line_num += 1
         elif line.startswith('-'):
             self._old_line_num += 1
@@ -345,12 +366,11 @@ class DiffAnalyzer:
 
     def _check_quality_signals(self, line):
         content = line[1:]  # Strip the '+' prefix
-        # Skip if inside a comment
+        # Block comments already filtered by _process_line; check inline -- comments
         comment_match = re.search(r'(?:^|\s)--', content)
         for pattern, name, message in self._QUALITY_SIGNALS:
             match = pattern.search(content)
             if match:
-                # If it's after a comment marker, skip
                 if comment_match and match.start() > comment_match.start():
                     continue
                 self.warnings.append({
@@ -686,10 +706,24 @@ def post_github_comment(pr: PullRequest, summary: str):
 # --- Main Execution ---
 def main():
     """Main execution block."""
-    # Ensure client can be initialized (checks API key)
-    get_client()
+    global _provider
 
-    model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-flash-preview')
+    # Initialize LLM provider
+    provider_name = os.environ.get("PROVIDER", "gemini")
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        # Per-provider fallbacks
+        fallback_keys = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+        fallback = fallback_keys.get(provider_name.lower(), "")
+        if fallback:
+            api_key = os.getenv(fallback)
+    if not api_key:
+        sys.exit(f"Error: API_KEY not set. Set API_KEY or the provider-specific key for '{provider_name}'.")
+
+    _provider = create_provider(provider_name, api_key)
+    logging.info(f"Using LLM provider: {_provider.name}")
+
+    model_name = os.environ.get("INPUT_MODEL", 'gemini-3-flash-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
     style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
@@ -844,6 +878,8 @@ def main():
         sys.exit("Error: GitHub PR object is unavailable — cannot post comment.")
     else:
         print("No GITHUB_TOKEN set. Printing summary to stdout:\n", final_summary)
+
+    logging.info(token_tracker.summary())
 
 if __name__ == "__main__":
     main()
