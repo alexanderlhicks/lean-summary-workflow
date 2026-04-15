@@ -3,58 +3,74 @@ import re
 import sys
 import json
 import hashlib
+import bisect
 import concurrent.futures
+import logging
+import subprocess
 import threading
-import time
 from datetime import datetime
 from collections import defaultdict
-from google import genai
 from github import Github, Auth
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
+from lean_utils import is_in_comment
+from llm_provider import LLMProvider, TokenUsage, create_provider
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # --- Constants ---
-MAX_DIFF_CHARS = 1_500_000
+MAX_FILE_DIFF_CHARS = 300_000
+MAX_STYLE_DIFF_CHARS = 1_500_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
-COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
-CACHE_IDENTIFIER = "<!-- gemini-cache: "
+COMMENT_IDENTIFIER = "<!-- lean-pr-summary-{{timestamp}} -->"
+LEGACY_COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
+CACHE_IDENTIFIER = "<!-- lean-summary-cache: "
+LEGACY_CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
-# --- Global Client and Rate Limiter ---
-_client = None
-_api_semaphore = threading.Semaphore(5)  # Cap concurrent Gemini API calls
+# --- Global Provider and Token Tracker ---
+_provider: LLMProvider = None  # Initialized in main()
 
-def get_client():
-    global _client
-    if _client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            sys.exit("Error: GEMINI_API_KEY environment variable not set.")
-        _client = genai.Client(api_key=api_key)
-    return _client
+
+class TokenTracker:
+    """Thread-safe cumulative token usage tracker."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.total_input = 0
+        self.total_output = 0
+        self.total_thinking = 0
+        self.call_count = 0
+
+    def record(self, usage: TokenUsage):
+        with self._lock:
+            self.call_count += 1
+            self.total_input += usage.input_tokens
+            self.total_output += usage.output_tokens
+            self.total_thinking += usage.thinking_tokens
+
+    def summary(self) -> str:
+        with self._lock:
+            total = self.total_input + self.total_output + self.total_thinking
+            parts = [f"Token usage: {self.total_input:,} input + {self.total_output:,} output"]
+            if self.total_thinking > 0:
+                parts.append(f" + {self.total_thinking:,} thinking")
+            parts.append(f" = {total:,} total across {self.call_count} API calls")
+            return "".join(parts)
+
+token_tracker = TokenTracker()
+
 
 # --- AI Generation ---
 
-def _call_gemini(prompt, model_name, response_mime_type=None, retries=3, backoff_factor=2):
-    """A helper function to call the Gemini API with retry logic and rate limiting."""
-    client = get_client()
-    kwargs = {}
-    if response_mime_type:
-        kwargs["config"] = {"response_mime_type": response_mime_type}
-
-    with _api_semaphore:
-        for i in range(retries):
-            try:
-                response = client.models.generate_content(model=model_name, contents=prompt, **kwargs)
-                return response.text
-            except Exception as e:
-                if i == retries - 1:
-                    print(f"Error: Gemini API call failed after {retries} attempts: {e}")
-                    return None
-                wait_time = backoff_factor ** (i + 1)
-                print(f"Warning: Gemini API call failed ({e}). Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-    return None
+def _call_llm(prompt, model_name, json_mode=False):
+    """Calls the LLM provider with retry logic and token tracking."""
+    if json_mode:
+        text, usage = _provider.generate_json(model_name, prompt)
+    else:
+        text, usage = _provider.generate_text(model_name, prompt)
+    token_tracker.record(usage)
+    return text
 
 def _read_prompt_template(template_name: str) -> str:
     action_path = os.path.dirname(os.path.realpath(__file__))
@@ -78,10 +94,23 @@ def split_diff_into_files(diff_content):
             files[match.group(2)] = full_file_diff
     return files
 
+
+def _truncate_file_diff(file_diff, max_chars=MAX_FILE_DIFF_CHARS):
+    """Truncate a single-file diff at hunk boundaries when possible."""
+    if len(file_diff) <= max_chars:
+        return file_diff, False
+
+    hunk_markers = [m.start() for m in re.finditer(r"\n@@ ", file_diff)]
+    candidate_markers = [pos for pos in hunk_markers if 0 < pos < max_chars]
+    if len(candidate_markers) >= 2:
+        cut_point = candidate_markers[-1]
+        return file_diff[:cut_point], True
+    return file_diff[:max_chars], True
+
 def summarize_file_diff(file_path, file_diff, model_name, prompt_template):
     """Generates a summary for a single file's diff (Map step)."""
     prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
-    return _call_gemini(prompt, model_name)
+    return _call_llm(prompt, model_name)
 
 def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint=""):
     """Synthesizes a final summary from per-file summaries (Reduce step)."""
@@ -91,7 +120,7 @@ def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_typ
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{PER_FILE_SUMMARIES}}", summaries_text) \
                             .replace("{{PR_TYPE_HINT}}", pr_type_hint)
-    result = _call_gemini(prompt, model_name)
+    result = _call_llm(prompt, model_name)
     if not result:
         raise RuntimeError("Failed to synthesize PR summary from per-file summaries.")
     return result
@@ -102,7 +131,7 @@ def check_style_adherence(diff_content, style_guide_content, model_name, prompt_
         return None
     prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
-    return _call_gemini(prompt, model_name)
+    return _call_llm(prompt, model_name)
 
 _PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
 
@@ -143,6 +172,16 @@ def _clean_json_response(response):
             clean = clean.strip("`").removeprefix("json").strip()
     return clean
 
+
+def _ordered_unique(file_paths):
+    seen = set()
+    ordered = []
+    for fp in file_paths:
+        if fp not in seen:
+            seen.add(fp)
+            ordered.append(fp)
+    return ordered
+
 def triage_files(file_paths, diff_by_file, model_name):
     """Uses the AI to filter out noise files before summarization.
     For large PRs, returns (high_priority, low_priority) tuple.
@@ -152,6 +191,7 @@ def triage_files(file_paths, diff_by_file, model_name):
 
     use_tiered = len(file_paths) > LARGE_PR_FILE_THRESHOLD
     file_list_str = _build_file_list_str(file_paths, diff_by_file, annotate_signals=use_tiered)
+    proof_signal_files = [fp for fp in file_paths if _detect_proof_signals(diff_by_file[fp])]
 
     if use_tiered:
         prompt_template = _read_prompt_template("triage_tiered.md")
@@ -159,7 +199,7 @@ def triage_files(file_paths, diff_by_file, model_name):
         prompt_template = _read_prompt_template("triage.md")
     prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
 
-    response = _call_gemini(prompt, model_name, response_mime_type="application/json")
+    response = _call_llm(prompt, model_name, json_mode=True)
     if not response:
         print("Warning: Triage agent failed. Proceeding with all files.")
         return file_paths, []
@@ -170,22 +210,48 @@ def triage_files(file_paths, diff_by_file, model_name):
         if use_tiered and isinstance(parsed, dict):
             high_set = set(parsed.get("high", []))
             low_set = set(parsed.get("low", []))
-            # Force-promote any low-priority file that has proof-relevant signals
-            for fp in list(low_set):
-                if fp in diff_by_file and _detect_proof_signals(diff_by_file[fp]):
+            for fp in proof_signal_files:
+                if fp not in high_set:
                     print(f"Promoting {fp} to high priority (contains proof-relevant signals).")
-                    low_set.discard(fp)
-                    high_set.add(fp)
+                low_set.discard(fp)
+                high_set.add(fp)
             # Preserve original file order from file_paths
             high = [f for f in file_paths if f in high_set]
             low = [f for f in file_paths if f in low_set]
             return high, low
-        elif isinstance(parsed, list):
-            return [f for f in parsed if f in file_paths], []
+        elif not use_tiered:
+            selected = []
+            if isinstance(parsed, list):
+                selected = parsed
+            elif isinstance(parsed, dict):
+                if isinstance(parsed.get("summarize"), list):
+                    selected = parsed["summarize"]
+                elif isinstance(parsed.get("high"), list):
+                    selected = parsed["high"]
+            selected_set = set(f for f in selected if f in file_paths)
+            selected_set.update(proof_signal_files)
+            selected = [f for f in file_paths if f in selected_set]
+            return selected, []
         return file_paths, []
     except json.JSONDecodeError:
         print(f"Warning: Triage agent returned invalid JSON: {response}. Proceeding with all files.")
         return file_paths, []
+
+
+def _load_lean_source(path, revision=None):
+    if revision:
+        result = subprocess.run(
+            ["git", "show", f"{revision}:{path}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
 
 def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint=""):
     """Two-stage synthesis for large PRs: group by directory, synthesize groups, then global."""
@@ -215,7 +281,7 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
                                     .replace("{{PR_BODY}}", "") \
                                     .replace("{{PER_FILE_SUMMARIES}}", group_text) \
                                     .replace("{{PR_TYPE_HINT}}", f"This is a sub-summary for the `{group_key}/` directory. ")
-            result = _call_gemini(prompt, model_name)
+            result = _call_llm(prompt, model_name)
             if result:
                 group_summaries.append(f"**{group_key}/**: {result.strip()}")
             else:
@@ -230,7 +296,7 @@ def refine_summary(draft_summary, pr_title, pr_body, model_name):
     prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{DRAFT_SUMMARY}}", draft_summary)
-    result = _call_gemini(prompt, model_name)
+    result = _call_llm(prompt, model_name)
     if not result:
         print("Warning: Refiner agent failed. Falling back to draft summary.")
         return draft_summary
@@ -240,7 +306,7 @@ def refine_summary(draft_summary, pr_title, pr_body, model_name):
 class DiffAnalyzer:
     """Parses a git diff to extract statistics and track 'sorry's."""
 
-    def __init__(self, decl_keywords):
+    def __init__(self, decl_keywords, base_revision=None):
         self.files_changed = set()
         self.lines_added = 0
         self.lines_removed = 0
@@ -252,23 +318,33 @@ class DiffAnalyzer:
         self.affected_decls = []
         self.warnings = []  # Lean quality signal warnings
         self._decl_keywords = decl_keywords
+        self._base_revision = base_revision
 
         self._current_file = ""
+        self._current_old_file = ""
         self._old_line_num = 0
         self._new_line_num = 0
+        self._comment_depth = 0  # Lean nested block comment depth
         self._current_decl_header = ""
         self._current_decl_name = ""
         self._raw_added = {}
         self._raw_removed = {}
         self._raw_added_decls = {}
         self._raw_removed_decls = {}
+        self._new_decl_cache = {}
+        self._old_decl_cache = {}
+        self._current_new_decl_index = ([], [])
+        self._current_old_decl_index = ([], [])
 
         self._file_path_regex = re.compile(r'diff --git a/(.+) b/(.+)')
         self._hunk_header_regex = re.compile(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@')
         keywords_regex_part = "|".join(re.escape(k) for k in self._decl_keywords)
-        self._name_extract_regex = re.compile(
-            r".*?(?:{})\s+([^\s\(\{{:]+)".format(keywords_regex_part)
+        self._decl_line_regex = re.compile(
+            r'^(?:@\[[^\]]+\]\s*)*'
+            r'(?:(?:local|private|protected|noncomputable|unsafe|partial|scoped)\s+)*'
+            r'(?P<keyword>{})\b(?:\s+|$)(?P<rest>.*)$'.format(keywords_regex_part)
         )
+        self._name_extract_regex = re.compile(r'^(?P<name>[^\s\(\{{:\[]+)')
 
     def analyze(self, diff):
         """Analyzes the diff and returns the results."""
@@ -306,10 +382,14 @@ class DiffAnalyzer:
     def _parse_file_header(self, line):
         match = self._file_path_regex.match(line)
         if match:
+            self._current_old_file = match.group(1)
             self._current_file = match.group(2)
             self.files_changed.add(self._current_file)
+            self._comment_depth = 0
             self._current_decl_header = ""
             self._current_decl_name = ""
+            self._current_new_decl_index = self._load_decl_index(self._current_file, is_old=False)
+            self._current_old_decl_index = self._load_decl_index(self._current_old_file, is_old=True)
             return True
         return False
 
@@ -318,10 +398,70 @@ class DiffAnalyzer:
         if match:
             self._old_line_num = int(match.group(1))
             self._new_line_num = int(match.group(3))
-            self._current_decl_header = ""
-            self._current_decl_name = ""
             return True
         return False
+
+    def _load_decl_index(self, file_path, is_old):
+        cache = self._old_decl_cache if is_old else self._new_decl_cache
+        if file_path in cache:
+            return cache[file_path]
+        source = _load_lean_source(file_path, self._base_revision if is_old else None)
+        decls = self._extract_declarations_from_source(source)
+        index = ([d['line'] for d in decls], decls)
+        cache[file_path] = index
+        return index
+
+    def _extract_declarations_from_source(self, source):
+        decls = []
+        comment_depth = 0
+        for line_num, line in enumerate(source.splitlines(), start=1):
+            in_comment, comment_depth = is_in_comment(line, comment_depth)
+            if in_comment:
+                continue
+            stripped = line.lstrip()
+            decl_info = self._parse_declaration_line(stripped, line_num)
+            if decl_info:
+                decls.append(decl_info)
+        return decls
+
+    def _parse_declaration_line(self, stripped_content, line_num):
+        match = self._decl_line_regex.match(stripped_content)
+        if not match:
+            return None
+        keyword = match.group('keyword')
+        rest = match.group('rest').lstrip()
+        name_match = self._name_extract_regex.match(rest)
+        if name_match:
+            name = name_match.group('name')
+        elif keyword == "example":
+            name = f"example@L{line_num}"
+        else:
+            return None
+        return {
+            'name': name,
+            'header': stripped_content.split(":=")[0].strip(),
+            'line': line_num,
+        }
+
+    def _lookup_decl(self, line_num, decl_index):
+        starts, decls = decl_index
+        if not starts:
+            return None
+        pos = bisect.bisect_right(starts, line_num) - 1
+        if pos < 0:
+            return None
+        return decls[pos]
+
+    def _set_current_decl_from_source(self, line):
+        if line.startswith('-'):
+            decl = self._lookup_decl(self._old_line_num, self._current_old_decl_index)
+        else:
+            decl = self._lookup_decl(self._new_line_num, self._current_new_decl_index)
+            if not decl and not line.startswith('+'):
+                decl = self._lookup_decl(self._old_line_num, self._current_old_decl_index)
+        if decl:
+            self._current_decl_name = decl['name']
+            self._current_decl_header = decl['header']
 
     # Patterns for Lean quality signals (only checked on added lines)
     _QUALITY_SIGNALS = [
@@ -333,9 +473,17 @@ class DiffAnalyzer:
     ]
 
     def _process_line(self, line):
-        self._track_sorries_and_decls(line)
+        # Strip diff marker to get the actual source line for comment detection
+        content_line = line[1:] if line.startswith(('+', '-')) else line
+        in_comment, self._comment_depth = is_in_comment(content_line, self._comment_depth)
+        self._set_current_decl_from_source(line)
+
+        if not in_comment:
+            self._track_sorries_and_decls(line)
+            if line.startswith('+'):
+                self._check_quality_signals(line)
+
         if line.startswith('+'):
-            self._check_quality_signals(line)
             self._new_line_num += 1
         elif line.startswith('-'):
             self._old_line_num += 1
@@ -345,12 +493,11 @@ class DiffAnalyzer:
 
     def _check_quality_signals(self, line):
         content = line[1:]  # Strip the '+' prefix
-        # Skip if inside a comment
+        # Block comments already filtered by _process_line; check inline -- comments
         comment_match = re.search(r'(?:^|\s)--', content)
         for pattern, name, message in self._QUALITY_SIGNALS:
             match = pattern.search(content)
             if match:
-                # If it's after a comment marker, skip
                 if comment_match and match.start() > comment_match.start():
                     continue
                 self.warnings.append({
@@ -366,25 +513,23 @@ class DiffAnalyzer:
         stripped_content = content.lstrip()
         
         # Track declarations
-        if any(stripped_content.startswith(keyword + ' ') for keyword in self._decl_keywords):
-            self._current_decl_header = stripped_content
-            name_match = self._name_extract_regex.match(self._current_decl_header)
-            if name_match:
-                self._current_decl_name = name_match.group(1)
-                # Use name + file as ID for categorization, but we might have multiple sorries
-                stable_id = f"{self._current_decl_name}@{self._current_file}"
-                decl_info = {
-                    'id': stable_id, 
-                    'file': self._current_file, 
-                    'name': self._current_decl_name, 
-                    'header': self._current_decl_header.split(":=")[0].strip()
-                }
-                if line.startswith('+'):
-                    decl_info['line'] = self._new_line_num
-                    self._raw_added_decls[stable_id] = decl_info
-                elif line.startswith('-'):
-                    decl_info['line'] = self._old_line_num
-                    self._raw_removed_decls[stable_id] = decl_info
+        decl_line_num = self._new_line_num if line.startswith('+') else self._old_line_num
+        decl_info = self._parse_declaration_line(stripped_content, decl_line_num)
+        if decl_info:
+            self._current_decl_name = decl_info['name']
+            self._current_decl_header = decl_info['header']
+            stable_id = f"{self._current_decl_name}@{self._current_file}"
+            raw_decl = {
+                'id': stable_id,
+                'file': self._current_file,
+                'name': self._current_decl_name,
+                'header': self._current_decl_header,
+                'line': decl_line_num,
+            }
+            if line.startswith('+'):
+                self._raw_added_decls[stable_id] = raw_decl
+            elif line.startswith('-'):
+                self._raw_removed_decls[stable_id] = raw_decl
 
         # Track sorries
         if 'sorry' in content and self._current_decl_name:
@@ -476,17 +621,20 @@ class SummaryCache:
 
     def _load_from_comment(self, pr: PullRequest):
         comment = find_existing_comment(pr)
-        if comment and CACHE_IDENTIFIER in comment.body:
-            try:
-                cache_str = comment.body.split(CACHE_IDENTIFIER, 1)[1].split("-->", 1)[0]
-                data = json.loads(cache_str)
-                # Invalidate entire cache if config fingerprint changed
-                if data.get("_config") != self._config_fingerprint:
-                    print("Cache invalidated: model or prompt template changed.")
+        if comment:
+            for marker in (CACHE_IDENTIFIER, LEGACY_CACHE_IDENTIFIER):
+                if marker not in comment.body:
+                    continue
+                try:
+                    cache_str = comment.body.split(marker, 1)[1].split("-->", 1)[0]
+                    data = json.loads(cache_str)
+                    # Invalidate entire cache if config fingerprint changed
+                    if data.get("_config") != self._config_fingerprint:
+                        print("Cache invalidated: model or prompt template changed.")
+                        return {}
+                    return data
+                except (IndexError, json.JSONDecodeError):
                     return {}
-                return data
-            except (IndexError, json.JSONDecodeError):
-                return {}
         return {}
 
     def get(self, file_path, file_diff_hash):
@@ -607,17 +755,34 @@ def _format_sorry_delta(added, removed):
     else:
         return f"> **`sorry` delta: 0** ({detail}) — no net change\n\n"
 
-def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache, warnings=None, title_note="", upstream_note=""):
+
+def _format_coverage_section(partially_analyzed_files, style_skipped):
+    if not partially_analyzed_files and not style_skipped:
+        return ""
+
+    res = "\n---\n\n**Coverage Notes**\n\n"
+    if partially_analyzed_files:
+        res += (
+            f"*   AI file summarization partially analyzed {len(partially_analyzed_files)} file(s) because "
+            f"their individual diffs exceeded the per-file size budget. Statistics and Lean signal tracking still cover the full PR.\n"
+        )
+        res += "<details><summary>Partially Analyzed Files</summary>\n\n"
+        for item in partially_analyzed_files:
+            res += f"*   `{item['file']}` (+{item['added']}/-{item['removed']})\n"
+        res += "</details>\n"
+    if style_skipped:
+        res += "*   Style-guide checking was skipped because the full diff exceeded the style-analysis size budget, and partial style results would be misleading.\n"
+    return res
+
+
+def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, style_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, style_skipped=False):
     """Formats the final summary comment in Markdown."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
     cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->\n\n" if cache else ""
 
     sorry_delta = _format_sorry_delta(added, removed)
-    summary = f"### 🤖 Gemini PR Summary\n\n{comment_id}\n\n{cache_html}{title_note}{upstream_note}{sorry_delta}{ai_summary}\n"
-
-    if truncated:
-        summary += "> *Note: The diff was too large and was truncated.*\n"
+    summary = f"### 🤖 PR Summary\n\n{comment_id}\n\n{cache_html}{title_note}{upstream_note}{sorry_delta}{ai_summary}\n"
     
     summary += _format_stats_section(stats)
     summary += _format_decls_section(added_decls, removed_decls, affected_decls)
@@ -626,11 +791,13 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
     if warnings:
         summary += _format_warnings_section(warnings)
 
+    summary += _format_coverage_section(partially_analyzed_files or [], style_skipped)
+
     if style_report:
         summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
     
-    if per_file_summaries:
-        summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in per_file_summaries) + "</details>\n"
+    if display_summaries:
+        summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
     
     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
@@ -670,7 +837,11 @@ def get_github_objects(token, repo_name, pr_number):
 
 def find_existing_comment(pr: PullRequest):
     """Finds a comment previously posted by this action."""
-    comment_regex = re.compile(COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"))
+    patterns = [
+        COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"),
+        LEGACY_COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"),
+    ]
+    comment_regex = re.compile("|".join(f"(?:{p})" for p in patterns))
     return next((c for c in pr.get_issue_comments() if comment_regex.search(c.body)), None)
 
 def post_github_comment(pr: PullRequest, summary: str):
@@ -686,10 +857,24 @@ def post_github_comment(pr: PullRequest, summary: str):
 # --- Main Execution ---
 def main():
     """Main execution block."""
-    # Ensure client can be initialized (checks API key)
-    get_client()
+    global _provider
 
-    model_name = os.environ.get("INPUT_GEMINI_MODEL", 'gemini-3-flash-preview')
+    # Initialize LLM provider
+    provider_name = os.environ.get("PROVIDER", "gemini")
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        # Per-provider fallbacks
+        fallback_keys = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+        fallback = fallback_keys.get(provider_name.lower(), "")
+        if fallback:
+            api_key = os.getenv(fallback)
+    if not api_key:
+        sys.exit(f"Error: API_KEY not set. Set API_KEY or the provider-specific key for '{provider_name}'.")
+
+    _provider = create_provider(provider_name, api_key)
+    logging.info(f"Using LLM provider: {_provider.name}")
+
+    model_name = os.environ.get("INPUT_MODEL", 'gemini-3-flash-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
     style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
@@ -701,7 +886,7 @@ def main():
     except FileNotFoundError:
         sys.exit("Error: pr.diff not found.")
 
-    analyzer = DiffAnalyzer(keywords)
+    analyzer = DiffAnalyzer(keywords, base_revision=os.environ.get("MERGE_BASE"))
     stats, added, removed, affected, added_decls, removed_decls, affected_decls, warnings = analyzer.analyze(diff)
 
     repo, pr, issues, pr_title, pr_body = None, None, [], "", ""
@@ -728,15 +913,6 @@ def main():
         if upstream_files:
             upstream_note = f"> ℹ️ This PR modifies {len(upstream_files)} file(s) under `{upstream_path}` — consider whether a corresponding upstream PR is needed.\n\n"
 
-    truncated = len(diff) > MAX_DIFF_CHARS
-    if truncated:
-        # Truncate at file boundaries to avoid malformed diffs
-        cut_point = diff.rfind("\ndiff --git ", 0, MAX_DIFF_CHARS)
-        if cut_point > 0:
-            diff = diff[:cut_point]
-        else:
-            diff = diff[:MAX_DIFF_CHARS]
-
     style_guide_content = ""
     if style_guide_path:
         try:
@@ -754,8 +930,11 @@ def main():
     else:
         print(f"Triage agent selected {len(files_to_summarize)}/{len(all_files)} files to summarize.")
 
-    per_file_summaries = []
+    synthesis_inputs = []
+    display_summaries = []
     style_report = None
+    partially_analyzed_files = []
+    style_skipped = False
 
     summarize_template = _read_prompt_template("summarize_file.md")
     config_fp = _compute_config_fingerprint(model_name, summarize_template)
@@ -768,13 +947,20 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         style_future = None
         if style_guide_content:
-            style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name, style_template)
+            if len(diff) <= MAX_STYLE_DIFF_CHARS:
+                style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name, style_template)
+            else:
+                style_skipped = True
 
         future_to_file = {}
         for fp in files_to_summarize:
-            fd = diff_by_file[fp]
+            fd, was_truncated = _truncate_file_diff(diff_by_file[fp], MAX_FILE_DIFF_CHARS)
             file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
             cached_summary = cache.get(fp, file_diff_hash) if cache else None
+            if was_truncated:
+                added_count = sum(1 for line in diff_by_file[fp].splitlines() if line.startswith('+') and not line.startswith('+++'))
+                removed_count = sum(1 for line in diff_by_file[fp].splitlines() if line.startswith('-') and not line.startswith('---'))
+                partially_analyzed_files.append({'file': fp, 'added': added_count, 'removed': removed_count})
 
             if cached_summary:
                 print(f"Cache hit for {fp}")
@@ -809,22 +995,26 @@ def main():
     # Assemble per-file summaries in original file order for deterministic output
     for fp in files_to_summarize:
         if fp in summary_by_file:
-            per_file_summaries.append(f"**{fp}**: {summary_by_file[fp]}")
+            entry = f"**{fp}**: {summary_by_file[fp]}"
+            synthesis_inputs.append(entry)
+            display_summaries.append(entry)
 
     # Add low-priority files as brief mentions (no AI call)
     for fp in low_priority:
         fd = diff_by_file[fp]
         added_count = sum(1 for line in fd.splitlines() if line.startswith('+') and not line.startswith('+++'))
         removed_count = sum(1 for line in fd.splitlines() if line.startswith('-') and not line.startswith('---'))
-        per_file_summaries.append(f"**{fp}**: *(minor changes, +{added_count}/-{removed_count})*")
+        entry = f"**{fp}**: *(minor changes, +{added_count}/-{removed_count})*"
+        synthesis_inputs.append(entry)
+        display_summaries.append(entry)
 
     try:
         # Use two-stage synthesis for very large PRs
-        if len(per_file_summaries) > LARGE_PR_SYNTHESIS_THRESHOLD:
-            print(f"Large PR detected ({len(per_file_summaries)} summaries). Using two-stage synthesis.")
-            draft_summary = synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint)
+        if len(synthesis_inputs) > LARGE_PR_SYNTHESIS_THRESHOLD:
+            print(f"Large PR detected ({len(synthesis_inputs)} summaries). Using two-stage synthesis.")
+            draft_summary = synthesize_summary_staged(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
         else:
-            draft_summary = synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint)
+            draft_summary = synthesize_summary(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
     except Exception as e:
         print(f"Error synthesizing final summary: {e}")
         # Create a fallback summary if synthesis fails
@@ -836,7 +1026,25 @@ def main():
         print(f"Warning: Refiner agent failed. Using draft summary. {e}")
         ai_summary = draft_summary
 
-    final_summary = format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, truncated, issues, per_file_summaries, style_report, cache, warnings, title_note, upstream_note)
+    final_summary = format_summary(
+        ai_summary,
+        stats,
+        added,
+        removed,
+        affected,
+        added_decls,
+        removed_decls,
+        affected_decls,
+        issues,
+        display_summaries,
+        style_report,
+        cache,
+        warnings,
+        title_note,
+        upstream_note,
+        partially_analyzed_files,
+        style_skipped,
+    )
     
     if pr:
         post_github_comment(pr, final_summary)
@@ -844,6 +1052,8 @@ def main():
         sys.exit("Error: GitHub PR object is unavailable — cannot post comment.")
     else:
         print("No GITHUB_TOKEN set. Printing summary to stdout:\n", final_summary)
+
+    logging.info(token_tracker.summary())
 
 if __name__ == "__main__":
     main()
