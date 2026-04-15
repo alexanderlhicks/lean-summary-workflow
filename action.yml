@@ -18,7 +18,7 @@ inputs:
     description: 'The Pull Request number'
     required: true
   model:
-    description: 'The LLM model to use (e.g., gemini-3-flash-preview, claude-sonnet-4-20250514, gpt-4o)'
+    description: 'The LLM model to use (e.g., gemini-3.1-flash, claude-opus-4-6-20250415, gpt-5.4-mini)'
     required: true
   lean_keywords:
     description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'

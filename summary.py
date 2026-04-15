@@ -874,7 +874,7 @@ def main():
     _provider = create_provider(provider_name, api_key)
     logging.info(f"Using LLM provider: {_provider.name}")
 
-    model_name = os.environ.get("INPUT_MODEL", 'gemini-3-flash-preview')
+    model_name = os.environ.get("INPUT_MODEL", 'gemini-3.1-flash')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
     style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
