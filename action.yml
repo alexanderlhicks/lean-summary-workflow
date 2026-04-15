@@ -69,6 +69,7 @@ runs:
     - name: Generate diff
       run: |
         MERGE_BASE=$(git merge-base ${{ github.event.pull_request.base.sha }} HEAD)
+        echo "MERGE_BASE=$MERGE_BASE" >> "$GITHUB_ENV"
         git diff "$MERGE_BASE" HEAD > pr.diff
       shell: bash
 
