@@ -61,7 +61,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
           provider: gemini  # or: anthropic, openai
-          model: gemini-3-flash-preview  # or: claude-sonnet-4-20250514, gpt-4o-mini
+          model: gemini-3-flash-preview  # or: claude-sonnet-4-6, gpt-5.4-mini
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
           # Optional:
@@ -111,7 +111,7 @@ This is safe for this action because it only reads the diff and posts a comment 
 | `github_token` | GitHub token for API calls. Should be set to `${{ secrets.GITHUB_TOKEN }}`. | Yes | |
 | `api_key` | API key for the LLM provider. Store as a repository secret. | Yes | |
 | `provider` | LLM provider: `gemini`, `anthropic`, or `openai`. | No | `gemini` |
-| `model` | The LLM model to use (e.g., `gemini-3-flash-preview`, `claude-sonnet-4-20250514`, `gpt-4o-mini`). | Yes | |
+| `model` | The LLM model to use (e.g., `gemini-3-flash-preview`, `claude-sonnet-4-6`, `gpt-5.4-mini`). | Yes | |
 | `github_repository` | The GitHub repository in `owner/repo` format. | Yes | |
 | `pr_number` | The pull request number. | Yes | |
 | `lean_keywords` | Comma-separated list of Lean declaration keywords to track for sorry attribution. | No | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
