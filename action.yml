@@ -25,6 +25,14 @@ inputs:
     description: 'Optional: Path to a style guide file for adherence checking'
     required: false
     default: 'CONTRIBUTING.md'
+  validate_title:
+    description: 'Validate PR title against conventional commit format: type[(scope)]: subject (scope is optional)'
+    required: false
+    default: 'false'
+  upstream_path:
+    description: 'Path prefix for upstream-bound files (e.g., ToMathlib/). If changed files match, a reminder is shown.'
+    required: false
+    default: ''
 runs:
   using: "composite"
   steps:
@@ -33,6 +41,12 @@ runs:
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: 0 # Fetch all history to enable diffing against base
+
+    - name: Mask secrets
+      run: |
+        echo "::add-mask::${{ inputs.gemini_api_key }}"
+        echo "::add-mask::${{ inputs.github_token }}"
+      shell: bash
 
     - name: Copy action requirements
       run: cp ${{ github.action_path }}/requirements.txt ./action-requirements.txt
@@ -50,7 +64,9 @@ runs:
       shell: bash
 
     - name: Generate diff
-      run: git diff ${{ github.event.pull_request.base.sha }} HEAD > pr.diff
+      run: |
+        MERGE_BASE=$(git merge-base ${{ github.event.pull_request.base.sha }} HEAD)
+        git diff "$MERGE_BASE" HEAD > pr.diff
       shell: bash
 
     - name: Generate summary
@@ -62,6 +78,8 @@ runs:
         INPUT_GEMINI_MODEL: ${{ inputs.gemini_model }}
         INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
         INPUT_STYLE_GUIDE_PATH: ${{ inputs.style_guide_path }}
+        INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
+        INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
       run: python ${{ github.action_path }}/summary.py
       shell: bash
 
