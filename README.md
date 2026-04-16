@@ -44,7 +44,7 @@ Create a workflow file at `.github/workflows/pr_summary.yml`:
 name: 'PR Summary'
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize]
 
 concurrency:
@@ -54,6 +54,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  issues: read
 
 jobs:
   summarize:
@@ -74,39 +75,9 @@ jobs:
           # upstream_path: 'ToMathlib/'
 ```
 
-> **Note on forked PRs:** The `pull_request` event does not expose repository secrets to workflows triggered by forks, and the `GITHUB_TOKEN` it provides is read-only. This means the above workflow will fail for PRs from external contributors. If your repository accepts fork PRs, use `pull_request_target` instead — but be aware that `pull_request_target` runs in the context of the base branch, so you must take care not to execute untrusted code from the fork.
-
-<details><summary>Example workflow for public repositories accepting fork PRs</summary>
-
-```yaml
-name: 'PR Summary'
-
-on:
-  pull_request_target:
-    types: [opened, synchronize]
-
-permissions:
-  contents: read
-  pull-requests: write
-
-jobs:
-  summarize:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate PR Summary
-        uses: your-org/your-repo-name@main
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.LLM_API_KEY }}
-          provider: gemini
-          model: gemini-3-flash-preview
-          github_repository: ${{ github.repository }}
-          pr_number: ${{ github.event.pull_request.number }}
-```
-
-This is safe for this action because it only reads the diff and posts a comment — it does not execute any code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch.
-
-</details>
+> **Note on the trigger:** This example uses `pull_request_target` so the workflow also runs for PRs from forks (the `pull_request` event does not expose repository secrets to fork-triggered workflows, and its `GITHUB_TOKEN` is read-only). `pull_request_target` runs in the context of the base branch, so take care not to execute untrusted code from the fork. This action is safe under `pull_request_target` because it only reads the diff and posts a comment — it does not execute code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch. If your repository does not accept fork PRs, you can switch the trigger to `pull_request` without other changes.
+>
+> The `issues: read` permission is used to link affected sorries to open GitHub issues labeled `proof wanted`.
 
 ## Inputs
 
