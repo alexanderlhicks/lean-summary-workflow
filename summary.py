@@ -25,9 +25,7 @@ MAX_STYLE_DIFF_CHARS = 1_500_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
 COMMENT_IDENTIFIER = "<!-- lean-pr-summary-{{timestamp}} -->"
-LEGACY_COMMENT_IDENTIFIER = "<!-- gemini-pr-summary-{{timestamp}} -->"
 CACHE_IDENTIFIER = "<!-- lean-summary-cache: "
-LEGACY_CACHE_IDENTIFIER = "<!-- gemini-cache: "
 
 # --- Global Provider and Token Tracker ---
 _provider: LLMProvider = None  # Initialized in main()
@@ -622,19 +620,18 @@ class SummaryCache:
     def _load_from_comment(self, pr: PullRequest):
         comment = find_existing_comment(pr)
         if comment:
-            for marker in (CACHE_IDENTIFIER, LEGACY_CACHE_IDENTIFIER):
-                if marker not in comment.body:
-                    continue
-                try:
-                    cache_str = comment.body.split(marker, 1)[1].split("-->", 1)[0]
-                    data = json.loads(cache_str)
-                    # Invalidate entire cache if config fingerprint changed
-                    if data.get("_config") != self._config_fingerprint:
-                        print("Cache invalidated: model or prompt template changed.")
-                        return {}
-                    return data
-                except (IndexError, json.JSONDecodeError):
+            if CACHE_IDENTIFIER not in comment.body:
+                return {}
+            try:
+                cache_str = comment.body.split(CACHE_IDENTIFIER, 1)[1].split("-->", 1)[0]
+                data = json.loads(cache_str)
+                # Invalidate entire cache if config fingerprint changed
+                if data.get("_config") != self._config_fingerprint:
+                    print("Cache invalidated: model or prompt template changed.")
                     return {}
+                return data
+            except (IndexError, json.JSONDecodeError):
+                return {}
         return {}
 
     def get(self, file_path, file_diff_hash):
@@ -837,11 +834,7 @@ def get_github_objects(token, repo_name, pr_number):
 
 def find_existing_comment(pr: PullRequest):
     """Finds a comment previously posted by this action."""
-    patterns = [
-        COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"),
-        LEGACY_COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"),
-    ]
-    comment_regex = re.compile("|".join(f"(?:{p})" for p in patterns))
+    comment_regex = re.compile(COMMENT_IDENTIFIER.replace("{{timestamp}}", ".*?"))
     return next((c for c in pr.get_issue_comments() if comment_regex.search(c.body)), None)
 
 def post_github_comment(pr: PullRequest, summary: str):
