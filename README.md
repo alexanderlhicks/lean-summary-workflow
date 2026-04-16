@@ -47,6 +47,10 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -56,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate PR Summary
-        uses: your-org/your-repo-name@main # Replace with your action's repository
+        uses: alexanderlhicks/lean-summary-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
