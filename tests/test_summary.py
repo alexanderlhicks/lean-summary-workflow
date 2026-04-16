@@ -94,11 +94,6 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(affected, [])
         self.assertIn("bodyOnly", added[0])
 
-    def test_find_existing_comment_matches_legacy_identifier(self):
-        pr = FakePR([FakeComment("text\n<!-- gemini-pr-summary-2026-01-01-00-00-00 -->\n")])
-        found = summary.find_existing_comment(pr)
-        self.assertIsNotNone(found)
-
 
 if __name__ == "__main__":
     unittest.main()

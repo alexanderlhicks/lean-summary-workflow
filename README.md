@@ -34,7 +34,7 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 6.  **Style Check (optional):** If a style guide is available and the diff is within the style-analysis size budget, a Style Checker Agent reviews the changes concurrently with file summarization.
 7.  **Synthesis:** The Synthesis Agent generates a structured overview from per-file summaries, PR title, and body. For very large PRs (40+ summaries), uses two-stage synthesis: per-directory groups first, then global.
 8.  **Refinement:** A Refiner Agent reviews the draft for accuracy, brevity, and professional tone.
-9.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, style report, and per-file summaries) is posted as a PR comment. Previous summary comments are found and updated (supports both current and legacy comment identifiers).
+9.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, style report, and per-file summaries) is posted as a PR comment. Previous summary comments are found and updated.
 
 ## Usage
 
