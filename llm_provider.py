@@ -100,7 +100,7 @@ class GeminiProvider(LLMProvider):
         from google import genai
         from google.genai import types
         self._types = types
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.client = genai.Client(api_key=api_key)
 
     def _generate_text_once(self, model, prompt, json_mode=False):
         config_kwargs = {}
@@ -131,7 +131,7 @@ class AnthropicProvider(LLMProvider):
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
         import anthropic
-        self.client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        self.client = anthropic.Anthropic(api_key=api_key)
 
     def _generate_text_once(self, model, prompt, json_mode=False):
         kwargs = {
@@ -165,7 +165,7 @@ class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
         from openai import OpenAI
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
+        self.client = OpenAI(api_key=api_key)
 
     def _generate_text_once(self, model, prompt, json_mode=False):
         kwargs = {
