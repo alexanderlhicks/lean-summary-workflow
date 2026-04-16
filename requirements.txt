@@ -1,4 +1,4 @@
-PyGithub>=2.0,<3.0
-google-genai>=1.0,<2.0
-anthropic>=1.0.0,<2.0.0
-openai>=1.0.0,<2.0.0
+PyGithub
+google-genai
+anthropic
+openai
