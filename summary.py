@@ -14,10 +14,39 @@ from github import Github, Auth
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
+from pydantic import BaseModel, Field
+
 from lean_utils import is_in_comment
-from llm_provider import LLMProvider, TokenUsage, create_provider
+from llm_provider import ContentPart, LLMProvider, TokenUsage, create_provider
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+# --- Pydantic schemas for structured LLM output ---
+
+class _ProseSummary(BaseModel):
+    """Wrapper for agents that emit a single block of markdown/prose."""
+    summary: str = Field(description="The requested summary or report, as markdown text.")
+
+
+class _TriageSimple(BaseModel):
+    """Triage output for small PRs: one flat list of files worth summarizing."""
+    summarize: list[str] = Field(
+        default_factory=list,
+        description="File paths (exactly as provided in the input list) that SHOULD be summarized.",
+    )
+
+
+class _TriageTiered(BaseModel):
+    """Triage output for large PRs: high- and low-priority tiers."""
+    high: list[str] = Field(
+        default_factory=list,
+        description="File paths for detailed summarization (functional / proof-relevant changes).",
+    )
+    low: list[str] = Field(
+        default_factory=list,
+        description="File paths for brief mention only (trivial or low-signal changes).",
+    )
 
 # --- Constants ---
 MAX_FILE_DIFF_CHARS = 300_000
@@ -61,14 +90,23 @@ token_tracker = TokenTracker()
 
 # --- AI Generation ---
 
-def _call_llm(prompt, model_name, json_mode=False):
-    """Calls the LLM provider with retry logic and token tracking."""
-    if json_mode:
-        text, usage = _provider.generate_json(model_name, prompt)
-    else:
-        text, usage = _provider.generate_text(model_name, prompt)
+def _call_llm(prompt, model_name, schema):
+    """Calls the LLM provider with retry logic and token tracking, parsing the
+    response into the given Pydantic schema.
+
+    Returns the parsed schema instance. Raises on provider failure after retries.
+    """
+    parts = [ContentPart(type="text", data=prompt)]
+    parsed, usage = _provider.generate_structured(
+        model=model_name, contents=parts, schema=schema,
+    )
     token_tracker.record(usage)
-    return text
+    return parsed
+
+
+def _call_prose(prompt, model_name):
+    """Convenience: run a prose-generating prompt, return the unwrapped string."""
+    return _call_llm(prompt, model_name, _ProseSummary).summary
 
 def _read_prompt_template(template_name: str) -> str:
     action_path = os.path.dirname(os.path.realpath(__file__))
@@ -108,7 +146,7 @@ def _truncate_file_diff(file_diff, max_chars=MAX_FILE_DIFF_CHARS):
 def summarize_file_diff(file_path, file_diff, model_name, prompt_template):
     """Generates a summary for a single file's diff (Map step)."""
     prompt = prompt_template.replace("{{FILE_PATH}}", file_path).replace("{{FILE_DIFF}}", file_diff)
-    return _call_llm(prompt, model_name)
+    return _call_prose(prompt, model_name)
 
 def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_type_hint=""):
     """Synthesizes a final summary from per-file summaries (Reduce step)."""
@@ -118,7 +156,7 @@ def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_typ
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{PER_FILE_SUMMARIES}}", summaries_text) \
                             .replace("{{PR_TYPE_HINT}}", pr_type_hint)
-    result = _call_llm(prompt, model_name)
+    result = _call_prose(prompt, model_name)
     if not result:
         raise RuntimeError("Failed to synthesize PR summary from per-file summaries.")
     return result
@@ -129,7 +167,7 @@ def check_style_adherence(diff_content, style_guide_content, model_name, prompt_
         return None
     prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
-    return _call_llm(prompt, model_name)
+    return _call_prose(prompt, model_name)
 
 _PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
 
@@ -159,18 +197,6 @@ def _build_file_list_str(file_paths, diff_by_file, annotate_signals=False):
         file_list_with_counts.append(entry)
     return "\n".join(file_list_with_counts)
 
-def _clean_json_response(response):
-    """Strip markdown code block formatting from a JSON response."""
-    clean = response.strip()
-    if clean.startswith("```"):
-        lines = clean.splitlines()
-        if len(lines) > 2:
-            clean = "\n".join(lines[1:-1])
-        else:
-            clean = clean.strip("`").removeprefix("json").strip()
-    return clean
-
-
 def _ordered_unique(file_paths):
     seen = set()
     ordered = []
@@ -193,47 +219,35 @@ def triage_files(file_paths, diff_by_file, model_name):
 
     if use_tiered:
         prompt_template = _read_prompt_template("triage_tiered.md")
+        schema = _TriageTiered
     else:
         prompt_template = _read_prompt_template("triage.md")
+        schema = _TriageSimple
     prompt = prompt_template.replace("{{FILE_LIST}}", file_list_str)
 
-    response = _call_llm(prompt, model_name, json_mode=True)
-    if not response:
-        print("Warning: Triage agent failed. Proceeding with all files.")
-        return file_paths, []
     try:
-        clean_response = _clean_json_response(response)
-        parsed = json.loads(clean_response)
+        parsed = _call_llm(prompt, model_name, schema)
+    except Exception as exc:
+        print(f"Warning: Triage agent failed ({exc}). Proceeding with all files.")
+        return file_paths, []
 
-        if use_tiered and isinstance(parsed, dict):
-            high_set = set(parsed.get("high", []))
-            low_set = set(parsed.get("low", []))
-            for fp in proof_signal_files:
-                if fp not in high_set:
-                    print(f"Promoting {fp} to high priority (contains proof-relevant signals).")
-                low_set.discard(fp)
-                high_set.add(fp)
-            # Preserve original file order from file_paths
-            high = [f for f in file_paths if f in high_set]
-            low = [f for f in file_paths if f in low_set]
-            return high, low
-        elif not use_tiered:
-            selected = []
-            if isinstance(parsed, list):
-                selected = parsed
-            elif isinstance(parsed, dict):
-                if isinstance(parsed.get("summarize"), list):
-                    selected = parsed["summarize"]
-                elif isinstance(parsed.get("high"), list):
-                    selected = parsed["high"]
-            selected_set = set(f for f in selected if f in file_paths)
-            selected_set.update(proof_signal_files)
-            selected = [f for f in file_paths if f in selected_set]
-            return selected, []
-        return file_paths, []
-    except json.JSONDecodeError:
-        print(f"Warning: Triage agent returned invalid JSON: {response}. Proceeding with all files.")
-        return file_paths, []
+    if use_tiered:
+        high_set = set(parsed.high)
+        low_set = set(parsed.low)
+        for fp in proof_signal_files:
+            if fp not in high_set:
+                print(f"Promoting {fp} to high priority (contains proof-relevant signals).")
+            low_set.discard(fp)
+            high_set.add(fp)
+        # Preserve original file order from file_paths
+        high = [f for f in file_paths if f in high_set]
+        low = [f for f in file_paths if f in low_set]
+        return high, low
+
+    selected_set = {f for f in parsed.summarize if f in file_paths}
+    selected_set.update(proof_signal_files)
+    selected = [f for f in file_paths if f in selected_set]
+    return selected, []
 
 
 def _load_lean_source(path, revision=None):
@@ -279,7 +293,11 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
                                     .replace("{{PR_BODY}}", "") \
                                     .replace("{{PER_FILE_SUMMARIES}}", group_text) \
                                     .replace("{{PR_TYPE_HINT}}", f"This is a sub-summary for the `{group_key}/` directory. ")
-            result = _call_llm(prompt, model_name)
+            try:
+                result = _call_prose(prompt, model_name)
+            except Exception as exc:
+                print(f"Warning: Sub-synthesis for {group_key}/ failed ({exc}). Falling back to raw summaries.")
+                result = ""
             if result:
                 group_summaries.append(f"**{group_key}/**: {result.strip()}")
             else:
@@ -294,11 +312,12 @@ def refine_summary(draft_summary, pr_title, pr_body, model_name):
     prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                             .replace("{{PR_BODY}}", pr_body) \
                             .replace("{{DRAFT_SUMMARY}}", draft_summary)
-    result = _call_llm(prompt, model_name)
-    if not result:
-        print("Warning: Refiner agent failed. Falling back to draft summary.")
+    try:
+        result = _call_prose(prompt, model_name)
+    except Exception as exc:
+        print(f"Warning: Refiner agent failed ({exc}). Falling back to draft summary.")
         return draft_summary
-    return result
+    return result or draft_summary
 
 # --- Diff Analysis ---
 class DiffAnalyzer:

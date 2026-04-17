@@ -2,3 +2,5 @@ PyGithub
 google-genai
 anthropic
 openai
+pydantic
+pymupdf
