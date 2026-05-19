@@ -70,7 +70,7 @@ jobs:
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
           # Optional:
-          # style_guide_path: 'CONTRIBUTING.md'
+          # additional_instructions_path: 'CONTRIBUTING.md'
           # validate_title: 'true'
           # upstream_path: 'ToMathlib/'
 ```
@@ -90,7 +90,7 @@ jobs:
 | `github_repository` | The GitHub repository in `owner/repo` format. | Yes | |
 | `pr_number` | The pull request number. | Yes | |
 | `lean_keywords` | Comma-separated list of Lean declaration keywords to track for sorry attribution. | No | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
-| `style_guide_path` | Path to a style guide file for adherence checking. | No | `CONTRIBUTING.md` |
+| `additional_instructions_path` | Path to a file with deployment-supplied instructions for the analysis agent. Use it for style guides, progress trackers, framework cross-checks, doc/wiki references, or any project-specific guidance the LLM should apply to the PR diff. The instructions themselves tell the agent what to produce. | No | `CONTRIBUTING.md` |
 | `validate_title` | Validate PR title against conventional commit format: `type[(scope)]: subject`. | No | `false` |
 | `upstream_path` | Path prefix for upstream-bound files. If changed files match, a reminder is shown. | No | |
 
@@ -106,9 +106,9 @@ lean-summary-workflow/
   prompts/
     triage.md              # Triage agent: file filtering
     triage_tiered.md       # Triage agent: high/low priority classification (50+ files)
-    summarize_file.md      # Summarizer agent: per-file summary generation
-    check_style.md         # Style checker: diff vs. style guide
-    synthesize_summary.md  # Synthesis agent: draft overview from per-file summaries
+    summarize_file.md          # Summarizer agent: per-file summary generation
+    additional_instructions.md # Additional-instructions agent: applies deployment-supplied instructions to the diff
+    synthesize_summary.md      # Synthesis agent: draft overview from per-file summaries
     refine_summary.md      # Refiner agent: polish draft into final summary
   tests/
     test_summary.py        # Unit tests
@@ -125,7 +125,7 @@ The behavior of each AI agent is governed by Markdown prompt templates in the `p
 | `triage.md` | Triage (normal) | `{{FILE_LIST}}` |
 | `triage_tiered.md` | Triage (50+ files) | `{{FILE_LIST}}` |
 | `summarize_file.md` | Summarizer | `{{FILE_PATH}}`, `{{FILE_DIFF}}` |
-| `check_style.md` | Style Checker | `{{STYLE_GUIDE_CONTENT}}`, `{{DIFF_CONTENT}}` |
+| `additional_instructions.md` | Additional-instructions | `{{INSTRUCTIONS_CONTENT}}`, `{{DIFF_CONTENT}}` |
 | `synthesize_summary.md` | Synthesizer | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{PER_FILE_SUMMARIES}}`, `{{PR_TYPE_HINT}}` |
 | `refine_summary.md` | Refiner | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{DRAFT_SUMMARY}}` |
 

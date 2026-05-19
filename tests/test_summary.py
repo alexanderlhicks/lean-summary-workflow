@@ -196,10 +196,10 @@ class SummaryTests(unittest.TestCase):
             result = summary.refine_summary("draft!", "title", "body", "model")
         self.assertEqual(result, "draft!")
 
-    def test_check_style_adherence_returns_none_without_style_guide(self):
-        # The empty-style-guide short-circuit must not hit the provider.
+    def test_apply_additional_instructions_returns_none_without_instructions(self):
+        # The empty-instructions short-circuit must not hit the provider.
         with mock.patch.object(summary, "_call_llm", side_effect=AssertionError("provider must not be called")):
-            result = summary.check_style_adherence("diff content", "", "model", "template")
+            result = summary.apply_additional_instructions("diff content", "", "model", "template")
         self.assertIsNone(result)
 
     # ------------------------------------------------------------------

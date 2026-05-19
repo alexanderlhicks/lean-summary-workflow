@@ -50,7 +50,7 @@ class _TriageTiered(BaseModel):
 
 # --- Constants ---
 MAX_FILE_DIFF_CHARS = 300_000
-MAX_STYLE_DIFF_CHARS = 1_500_000
+MAX_INSTRUCTIONS_DIFF_CHARS = 1_500_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
 COMMENT_IDENTIFIER = "<!-- lean-pr-summary-{{timestamp}} -->"
@@ -122,7 +122,8 @@ def split_diff_into_files(diff_content):
     files = {}
     file_diffs = re.split(r'^diff --git ', diff_content, flags=re.MULTILINE)
     for file_diff in file_diffs:
-        if not file_diff.strip(): continue
+        if not file_diff.strip():
+            continue
         # Re-add the split marker
         full_file_diff = "diff --git " + file_diff
         match = re.search(r'^diff --git a/(.+) b/(.+)', full_file_diff, flags=re.MULTILINE)
@@ -161,11 +162,18 @@ def synthesize_summary(per_file_summaries, model_name, pr_title, pr_body, pr_typ
         raise RuntimeError("Failed to synthesize PR summary from per-file summaries.")
     return result
 
-def check_style_adherence(diff_content, style_guide_content, model_name, prompt_template):
-    """Checks the diff against a style guide."""
-    if not style_guide_content:
+def apply_additional_instructions(diff_content, instructions_content, model_name, prompt_template):
+    """Applies deployment-supplied instructions to the diff.
+
+    The instructions file is a project-controlled prompt-extension: it can
+    encode a style guide (request a violation listing), a progress tracker
+    (request a structured assessment), a doc/wiki cross-check, etc. The
+    function is intentionally agnostic about output shape — the instructions
+    themselves tell the agent what to produce.
+    """
+    if not instructions_content:
         return None
-    prompt = prompt_template.replace("{{STYLE_GUIDE_CONTENT}}", style_guide_content) \
+    prompt = prompt_template.replace("{{INSTRUCTIONS_CONTENT}}", instructions_content) \
                             .replace("{{DIFF_CONTENT}}", diff_content)
     return _call_prose(prompt, model_name)
 
@@ -772,8 +780,8 @@ def _format_sorry_delta(added, removed):
         return f"> **`sorry` delta: 0** ({detail}) — no net change\n\n"
 
 
-def _format_coverage_section(partially_analyzed_files, style_skipped):
-    if not partially_analyzed_files and not style_skipped:
+def _format_coverage_section(partially_analyzed_files, instructions_skipped):
+    if not partially_analyzed_files and not instructions_skipped:
         return ""
 
     res = "\n---\n\n**Coverage Notes**\n\n"
@@ -786,12 +794,12 @@ def _format_coverage_section(partially_analyzed_files, style_skipped):
         for item in partially_analyzed_files:
             res += f"*   `{item['file']}` (+{item['added']}/-{item['removed']})\n"
         res += "</details>\n"
-    if style_skipped:
-        res += "*   Style-guide checking was skipped because the full diff exceeded the style-analysis size budget, and partial style results would be misleading.\n"
+    if instructions_skipped:
+        res += "*   Additional-instructions analysis was skipped because the full diff exceeded the analysis size budget, and partial results would be misleading.\n"
     return res
 
 
-def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, style_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, style_skipped=False):
+def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, instructions_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, instructions_skipped=False):
     """Formats the final summary comment in Markdown."""
     timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
@@ -799,7 +807,7 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
 
     sorry_delta = _format_sorry_delta(added, removed)
     summary = f"### 🤖 PR Summary\n\n{comment_id}\n\n{cache_html}{title_note}{upstream_note}{sorry_delta}{ai_summary}\n"
-    
+
     summary += _format_stats_section(stats)
     summary += _format_decls_section(added_decls, removed_decls, affected_decls)
     summary += _format_sorry_section(added, removed, affected, issues)
@@ -807,13 +815,13 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
     if warnings:
         summary += _format_warnings_section(warnings)
 
-    summary += _format_coverage_section(partially_analyzed_files or [], style_skipped)
+    summary += _format_coverage_section(partially_analyzed_files or [], instructions_skipped)
 
-    if style_report:
-        summary += f"\n---\n\n<details><summary>🎨 **Style Guide Adherence**</summary>\n\n{style_report}\n</details>\n"
+    if instructions_report:
+        summary += f"\n---\n\n<details><summary>📋 **Additional Analysis**</summary>\n\n{instructions_report}\n</details>\n"
     
     if display_summaries:
-        summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
+        summary += "\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
     
     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
@@ -888,7 +896,7 @@ def main():
 
     model_name = os.environ.get("INPUT_MODEL", 'gemini-3-flash-preview')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
-    style_guide_path = os.environ.get("INPUT_STYLE_GUIDE_PATH")
+    instructions_path = os.environ.get("INPUT_ADDITIONAL_INSTRUCTIONS_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
     upstream_path = os.environ.get("INPUT_UPSTREAM_PATH", "")
 
@@ -925,13 +933,13 @@ def main():
         if upstream_files:
             upstream_note = f"> ℹ️ This PR modifies {len(upstream_files)} file(s) under `{upstream_path}` — consider whether a corresponding upstream PR is needed.\n\n"
 
-    style_guide_content = ""
-    if style_guide_path:
+    instructions_content = ""
+    if instructions_path:
         try:
-            with open(style_guide_path, "r") as f:
-                style_guide_content = f.read()
+            with open(instructions_path, "r") as f:
+                instructions_content = f.read()
         except FileNotFoundError:
-            print(f"Warning: Style guide file not found at {style_guide_path}")
+            print(f"Warning: Additional instructions file not found at {instructions_path}")
 
     diff_by_file = split_diff_into_files(diff)
     all_files = list(diff_by_file.keys())
@@ -944,25 +952,25 @@ def main():
 
     synthesis_inputs = []
     display_summaries = []
-    style_report = None
+    instructions_report = None
     partially_analyzed_files = []
-    style_skipped = False
+    instructions_skipped = False
 
     summarize_template = _read_prompt_template("summarize_file.md")
     config_fp = _compute_config_fingerprint(model_name, summarize_template)
     cache = SummaryCache(pr, config_fp) if pr else None
-    style_template = _read_prompt_template("check_style.md") if style_guide_content else ""
+    instructions_template = _read_prompt_template("additional_instructions.md") if instructions_content else ""
 
     # Collect summaries keyed by file path so we can assemble in deterministic order
     summary_by_file = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        style_future = None
-        if style_guide_content:
-            if len(diff) <= MAX_STYLE_DIFF_CHARS:
-                style_future = executor.submit(check_style_adherence, diff, style_guide_content, model_name, style_template)
+        instructions_future = None
+        if instructions_content:
+            if len(diff) <= MAX_INSTRUCTIONS_DIFF_CHARS:
+                instructions_future = executor.submit(apply_additional_instructions, diff, instructions_content, model_name, instructions_template)
             else:
-                style_skipped = True
+                instructions_skipped = True
 
         future_to_file = {}
         for fp in files_to_summarize:
@@ -998,11 +1006,11 @@ def main():
                 print(f"Warning: Summarization for {fp} generated an exception: {exc}")
                 summary_by_file[fp] = f"*Summary unavailable — error: {exc}*"
 
-        if style_future:
+        if instructions_future:
             try:
-                style_report = style_future.result()
+                instructions_report = instructions_future.result()
             except Exception as exc:
-                print(f"Warning: Style check generated an exception: {exc}")
+                print(f"Warning: Additional-instructions analysis generated an exception: {exc}")
 
     # Assemble per-file summaries in original file order for deterministic output
     for fp in files_to_summarize:
@@ -1049,13 +1057,13 @@ def main():
         affected_decls,
         issues,
         display_summaries,
-        style_report,
+        instructions_report,
         cache,
         warnings,
         title_note,
         upstream_note,
         partially_analyzed_files,
-        style_skipped,
+        instructions_skipped,
     )
     
     if pr:
