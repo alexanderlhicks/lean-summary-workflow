@@ -24,8 +24,8 @@ inputs:
     description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
     required: false
     default: 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom'
-  style_guide_path:
-    description: 'Optional: Path to a style guide file for adherence checking'
+  additional_instructions_path:
+    description: 'Optional: Path to a file with deployment-supplied instructions for the analysis agent. Use it for style guides, progress trackers, framework cross-checks, doc/wiki references, or any project-specific guidance the LLM should apply to the PR diff.'
     required: false
     default: 'CONTRIBUTING.md'
   validate_title:
@@ -82,7 +82,7 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number }}
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_LEAN_KEYWORDS: ${{ inputs.lean_keywords }}
-        INPUT_STYLE_GUIDE_PATH: ${{ inputs.style_guide_path }}
+        INPUT_ADDITIONAL_INSTRUCTIONS_PATH: ${{ inputs.additional_instructions_path }}
         INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
         INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
       run: python ${{ github.action_path }}/summary.py

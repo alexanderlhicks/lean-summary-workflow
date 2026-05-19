@@ -42,7 +42,7 @@ jobs:
 
       - name: Verify prompt templates exist
         run: |
-          for f in triage.md triage_tiered.md summarize_file.md check_style.md synthesize_summary.md refine_summary.md; do
+          for f in triage.md triage_tiered.md summarize_file.md additional_instructions.md synthesize_summary.md refine_summary.md; do
             test -f "prompts/$f" || { echo "Missing prompt template: $f"; exit 1; }
           done
 
@@ -132,7 +132,7 @@ jobs:
           print('Config fingerprint: OK')
 
           # --- Prompt templates load ---
-          for name in ['triage.md', 'triage_tiered.md', 'summarize_file.md', 'check_style.md', 'synthesize_summary.md', 'refine_summary.md']:
+          for name in ['triage.md', 'triage_tiered.md', 'summarize_file.md', 'additional_instructions.md', 'synthesize_summary.md', 'refine_summary.md']:
               t = summary._read_prompt_template(name)
               assert len(t) > 0, f'Prompt template {name} is empty'
           print('Prompt templates: OK')
