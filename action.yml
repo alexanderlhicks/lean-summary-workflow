@@ -85,6 +85,11 @@ runs:
         INPUT_ADDITIONAL_INSTRUCTIONS_PATH: ${{ inputs.additional_instructions_path }}
         INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
         INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
+        # MERGE_BASE is set in the preceding "Generate diff" step via
+        # `echo "MERGE_BASE=..." >> "$GITHUB_ENV"`. Re-declaring it here
+        # makes the dependency explicit (the CI env-var consistency check
+        # only inspects this env block) and is a runtime no-op.
+        MERGE_BASE: ${{ env.MERGE_BASE }}
       run: python ${{ github.action_path }}/summary.py
       shell: bash
 

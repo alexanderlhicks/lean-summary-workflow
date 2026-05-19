@@ -122,7 +122,8 @@ def split_diff_into_files(diff_content):
     files = {}
     file_diffs = re.split(r'^diff --git ', diff_content, flags=re.MULTILINE)
     for file_diff in file_diffs:
-        if not file_diff.strip(): continue
+        if not file_diff.strip():
+            continue
         # Re-add the split marker
         full_file_diff = "diff --git " + file_diff
         match = re.search(r'^diff --git a/(.+) b/(.+)', full_file_diff, flags=re.MULTILINE)
@@ -820,7 +821,7 @@ def format_summary(ai_summary, stats, added, removed, affected, added_decls, rem
         summary += f"\n---\n\n<details><summary>📋 **Additional Analysis**</summary>\n\n{instructions_report}\n</details>\n"
     
     if display_summaries:
-        summary += f"\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
+        summary += "\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
     
     summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
     return summary
