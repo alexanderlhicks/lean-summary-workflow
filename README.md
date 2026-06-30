@@ -1,13 +1,13 @@
 # PR Summary Action
 
-This GitHub Action generates a concise, high-level summary for a pull request using an LLM API (Gemini, Anthropic Claude, or OpenAI GPT). It analyzes the PR's title, body, and git diff to produce a structured summary, and includes special features for analyzing [Lean](https://lean-lang.org/) projects.
+This GitHub Action generates a concise, high-level summary for a pull request using an LLM, accessed through [OpenRouter](https://openrouter.ai). It analyzes the PR's title, body, and git diff to produce a structured summary, and includes special features for analyzing [Lean](https://lean-lang.org/) projects.
 
 For pull requests with multiple file changes, the action employs a hierarchical approach: it first generates a summary for each individual file's changes and then synthesizes these into a comprehensive, high-level overview of the entire pull request. This ensures that even complex changes are accurately and clearly summarized.
 
 ## Features
 
-*   **Multi-Provider Support:** Supports Gemini, Anthropic (Claude), and OpenAI (GPT) as interchangeable backends via a provider abstraction layer. Each provider handles text and JSON generation with smart retry logic (distinguishes retryable from fatal errors) and rate limiting.
-*   **Multi-Agent Pipeline:** Employs a pipeline of specialized AI agents (Triage, Summarizer, Synthesizer, Refiner) to ensure high-quality, professional summaries.
+*   **Any model via OpenRouter:** A single OpenRouter-backed client reaches Claude, Gemini, GPT, and others — the model is selected purely by its OpenRouter slug (e.g. `anthropic/claude-opus-4.8`), with no per-provider code. Structured (schema-validated) output, multimodal input, reasoning effort, and rate-limit/retry backoff are handled uniformly.
+*   **Multi-Agent Pipeline:** Employs a pipeline of specialized AI agents (Triage, Summarizer, Synthesizer) that produce a reviewer-oriented overview. The summary is intended as an entry point: it describes the PR's scope, structure, and contents so a reviewer can orient before opening the diff (deep, suggestion-level review is a separate concern). Prompts favor breadth and a self-contained overview over terseness.
 *   **Parallel Execution:** Summarizes multiple files concurrently (up to 10 workers), with per-file diff caching to avoid re-summarizing unchanged files across PR updates.
 *   **Smart Triage:** Automatically filters out noise (lockfiles, binaries, generated code) to focus the summary on meaningful changes. Files with proof-relevant signals (`sorry`, `admit`, `native_decide`) are always included regardless of triage decisions.
 *   **Lean-Aware Analysis:**
@@ -17,9 +17,9 @@ For pull requests with multiple file changes, the action employs a hierarchical 
     *   **Declaration tracking:** Reports new, removed, and affected declarations.
     *   **Quality signals:** Warns on `admit`, `native_decide`, debug commands (`#check`/`#eval`), and `set_option autoImplicit true` in added lines.
     *   **Issue linking:** Links affected sorries to open GitHub issues labeled `proof wanted`.
-*   **Large-PR Scaling:** For PRs with many files (50+), automatically switches to tiered triage (high/low priority) and two-stage synthesis (per-directory then global). Individual file diffs exceeding the per-file size budget are truncated at hunk boundaries, with a coverage note in the output. Style checking is skipped entirely for very large diffs to avoid misleading partial results.
-*   **Per-File Summary Caching:** Caches file summaries in a hidden HTML comment on the PR. On subsequent runs (e.g., `synchronize` events), only files whose diffs changed are re-summarized. Cache is invalidated when the model or prompt template changes.
-*   **Optional Style Guide Adherence Check:** Reviews code changes against a specified style guide (e.g., `CONTRIBUTING.md`).
+*   **Large-PR Scaling:** For PRs with many files (50+), automatically switches to tiered triage (high/low priority) and two-stage synthesis (per-directory then global). Individual file diffs exceeding the per-file size budget are truncated at a hunk boundary where possible (otherwise at a line boundary), with a coverage note in the output. The additional-instructions analysis is skipped entirely when the overall diff exceeds its size budget, to avoid misleading partial results.
+*   **Per-File Summary Caching:** Caches file summaries in a hidden HTML comment on the PR. On subsequent runs (e.g., `synchronize` events), only files whose diffs changed are re-summarized. Cache is invalidated when the model or prompt template changes, and is pruned each run to the files in the current diff so it cannot accumulate stale entries (e.g. from renamed/removed files) and bloat the comment.
+*   **Optional Additional-Instructions Analysis:** Applies deployment-supplied instructions (via `additional_instructions_path`) to the diff — e.g. a style guide such as `CONTRIBUTING.md`, a progress tracker, or any project-specific guidance. The instructions themselves tell the agent what to produce.
 *   **Optional PR Title Validation:** Validates PR titles against conventional commit format (`type[(scope)]: subject`) and uses the parsed type to inform summary structure.
 *   **Upstream Path Reminders:** Flags when changed files fall under a configurable path prefix (e.g., `ToMathlib/`) and reminds about upstream PRs.
 *   **Token Usage Tracking:** Logs cumulative input, output, and thinking token usage across all API calls.
@@ -31,10 +31,9 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 3.  **Analyze Diff:** The `DiffAnalyzer` parses the full diff to extract statistics, sorry tracking (with source-level declaration attribution), declaration changes, and quality signal warnings. Nested block comments are correctly handled.
 4.  **Triage Files:** A Triage Agent reviews the file list and filters out noise. For large PRs (50+ files), files are classified into high/low priority tiers. Files containing proof-relevant signals are always promoted to high priority.
 5.  **Parallel Summarization:** Each high-priority file's diff is summarized concurrently by a Summarizer Agent. Cached summaries from previous runs are reused when the diff hash matches. Large individual file diffs are truncated at hunk boundaries.
-6.  **Style Check (optional):** If a style guide is available and the diff is within the style-analysis size budget, a Style Checker Agent reviews the changes concurrently with file summarization.
-7.  **Synthesis:** The Synthesis Agent generates a structured overview from per-file summaries, PR title, and body. For very large PRs (40+ summaries), uses two-stage synthesis: per-directory groups first, then global.
-8.  **Refinement:** A Refiner Agent reviews the draft for accuracy, brevity, and professional tone.
-9.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, style report, and per-file summaries) is posted as a PR comment. Previous summary comments are found and updated.
+6.  **Additional-Instructions Analysis (optional):** If an instructions file is available and the diff is within the analysis size budget, an Additional-Instructions Agent applies those instructions (e.g. a style guide) to the diff concurrently with file summarization.
+7.  **Synthesis:** The Synthesis Agent generates a structured, self-contained overview from per-file summaries, PR title, and body. For very large PRs (40+ summaries), uses two-stage synthesis: per-directory groups first, then global. Files triaged out entirely are still noted, so the file count reconciles and nothing is invisible.
+8.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, additional analysis, and per-file summaries) is posted as a PR comment. Declaration and `sorry` listings are grouped by file, sorted deterministically, and capped with an overflow note on very large PRs. The comment body is kept under GitHub's size limit by shedding regenerable content (cache, then per-file summaries) if needed. Previous summary comments are found and updated.
 
 ## Usage
 
@@ -64,9 +63,8 @@ jobs:
         uses: alexanderlhicks/lean-summary-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.LLM_API_KEY }}
-          provider: gemini  # or: anthropic, openai
-          model: gemini-3-flash-preview  # or: claude-sonnet-4-6, gpt-5.4-mini
+          api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          model: anthropic/claude-haiku-4.5  # any OpenRouter slug, e.g. google/gemini-3-flash-preview, openai/gpt-5-mini
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
           # Optional:
@@ -84,13 +82,13 @@ jobs:
 | Input | Description | Required | Default |
 |---|---|---|---|
 | `github_token` | GitHub token for API calls. Should be set to `${{ secrets.GITHUB_TOKEN }}`. | Yes | |
-| `api_key` | API key for the LLM provider. Store as a repository secret. | Yes | |
-| `provider` | LLM provider: `gemini`, `anthropic`, or `openai`. | No | `gemini` |
-| `model` | The LLM model to use (e.g., `gemini-3-flash-preview`, `claude-sonnet-4-6`, `gpt-5.4-mini`). | Yes | |
+| `api_key` | OpenRouter API key. Store as a repository secret. | Yes | |
+| `model` | OpenRouter model slug (e.g., `anthropic/claude-opus-4.8`, `google/gemini-3-pro-preview`, `openai/gpt-5`). | Yes | |
 | `github_repository` | The GitHub repository in `owner/repo` format. | Yes | |
 | `pr_number` | The pull request number. | Yes | |
 | `lean_keywords` | Comma-separated list of Lean declaration keywords to track for sorry attribution. | No | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
 | `additional_instructions_path` | Path to a file with deployment-supplied instructions for the analysis agent. Use it for style guides, progress trackers, framework cross-checks, doc/wiki references, or any project-specific guidance the LLM should apply to the PR diff. The instructions themselves tell the agent what to produce. | No | `CONTRIBUTING.md` |
+| `reasoning_effort` | Reasoning/thinking effort applied to every model call: `low`, `medium`, or `high`. Empty uses the model default. Ignored by models without reasoning support. | No | `` |
 | `validate_title` | Validate PR title against conventional commit format: `type[(scope)]: subject`. | No | `false` |
 | `upstream_path` | Path prefix for upstream-bound files. If changed files match, a reminder is shown. | No | |
 
@@ -100,16 +98,16 @@ jobs:
 lean-summary-workflow/
   action.yml               # GitHub Actions composite action definition
   summary.py               # Main summary orchestration (multi-agent pipeline)
-  llm_provider.py          # LLM provider abstraction (Gemini, Anthropic, OpenAI)
+  llm_provider.py          # OpenRouter-backed LLM client (single provider)
   lean_utils.py            # Lean 4 nested block comment parser
-  requirements.txt         # Python dependencies
+  pyproject.toml           # Project metadata + dependencies (uv)
+  uv.lock                  # Pinned dependency lockfile
   prompts/
     triage.md              # Triage agent: file filtering
     triage_tiered.md       # Triage agent: high/low priority classification (50+ files)
     summarize_file.md          # Summarizer agent: per-file summary generation
     additional_instructions.md # Additional-instructions agent: applies deployment-supplied instructions to the diff
-    synthesize_summary.md      # Synthesis agent: draft overview from per-file summaries
-    refine_summary.md      # Refiner agent: polish draft into final summary
+    synthesize_summary.md      # Synthesis agent: self-contained overview from per-file summaries
   tests/
     test_summary.py        # Unit tests
 ```
@@ -127,20 +125,21 @@ The behavior of each AI agent is governed by Markdown prompt templates in the `p
 | `summarize_file.md` | Summarizer | `{{FILE_PATH}}`, `{{FILE_DIFF}}` |
 | `additional_instructions.md` | Additional-instructions | `{{INSTRUCTIONS_CONTENT}}`, `{{DIFF_CONTENT}}` |
 | `synthesize_summary.md` | Synthesizer | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{PER_FILE_SUMMARIES}}`, `{{PR_TYPE_HINT}}` |
-| `refine_summary.md` | Refiner | `{{PR_TITLE}}`, `{{PR_BODY}}`, `{{DRAFT_SUMMARY}}` |
 
 ## Development
 
 ### Running Tests
 
+This project uses [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install -r requirements.txt
-python -m pytest tests/ -v
+uv run pytest tests/ -v   # uv resolves the env from uv.lock automatically
+uv run ruff check summary.py
 ```
 
 ### Dependencies
 
-See `requirements.txt`: `PyGithub`, `google-genai`, `anthropic`, `openai`.
+Declared in `pyproject.toml` (pinned in `uv.lock`): `PyGithub`, `openai` (pointed at OpenRouter), `pydantic`.
 
 ### CI
 
