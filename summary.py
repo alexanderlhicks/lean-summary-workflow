@@ -2,13 +2,14 @@ import os
 import re
 import sys
 import json
+import base64
 import hashlib
 import bisect
 import concurrent.futures
 import logging
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from github import Github, Auth
 from github.PullRequest import PullRequest
@@ -49,12 +50,28 @@ class _TriageTiered(BaseModel):
     )
 
 # --- Constants ---
-MAX_FILE_DIFF_CHARS = 300_000
-MAX_INSTRUCTIONS_DIFF_CHARS = 1_500_000
+# Defaults for the diff-size budgets; both are overridable via action inputs
+# (INPUT_MAX_FILE_DIFF_CHARS / INPUT_MAX_INSTRUCTIONS_DIFF_CHARS). Rough sizing
+# guide: typical Lean averages ~50 chars/line (a mix of short tactic lines and
+# longer signatures), and ~4 chars ≈ 1 token, so 1,000 lines ≈ 50,000 chars
+# ≈ ~12k tokens.
+#
+# Per-file diff sent to the summarizer; above this it is truncated at a hunk
+# boundary (with a coverage note). 60,000 chars ≈ ~1,200 lines ≈ ~15k tokens.
+MAX_FILE_DIFF_CHARS = 60_000
+# Whole-PR diff sent to the additional-instructions agent in one call; above
+# this the analysis is skipped (a partial result would mislead). Must fit the
+# model's context alongside the instructions file and the response. 400,000
+# chars ≈ ~8,000 changed lines ≈ ~100k tokens (fits a ~128k-token model). The
+# old 1.5M default exceeded most cheap models' context, so those calls failed
+# rather than ran. Lower for a smaller-context model.
+MAX_INSTRUCTIONS_DIFF_CHARS = 400_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
 COMMENT_IDENTIFIER = "<!-- lean-pr-summary-{{timestamp}} -->"
 CACHE_IDENTIFIER = "<!-- lean-summary-cache: "
+MAX_COMMENT_CHARS = 65_536  # GitHub's hard limit on an issue/PR comment body
+MAX_LISTED_DECLS = 150  # Cap on individually-listed declarations (grouped by file) before an overflow note
 
 # --- Global Provider and Token Tracker ---
 _provider: LLMProvider = None  # Initialized in main()
@@ -89,6 +106,27 @@ token_tracker = TokenTracker()
 
 
 # --- AI Generation ---
+
+def _reasoning_kwargs(reasoning_effort):
+    """Map a reasoning_effort string to create_provider kwargs.
+
+    Returns {"reasoning_default": {"effort": <level>}} for low/medium/high;
+    {} for empty or unrecognized values (model default)."""
+    effort = (reasoning_effort or "").strip().lower()
+    if effort in ("low", "medium", "high"):
+        return {"reasoning_default": {"effort": effort}}
+    return {}
+
+
+def _positive_int(value, default):
+    """Parse a positive int from an action-input string; fall back to `default`
+    on empty, missing, non-numeric, or non-positive input."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
 
 def _call_llm(prompt, model_name, schema):
     """Calls the LLM provider with retry logic and token tracking, parsing the
@@ -132,16 +170,50 @@ def split_diff_into_files(diff_content):
     return files
 
 
+def _count_diff_lines(file_diff):
+    """Count added/removed content lines in a single-file diff.
+
+    Skips the per-file header region (everything before the first `@@` hunk
+    header) so a content line whose text starts with '++' or '--' is counted
+    correctly and the `+++ b/...` / `--- a/...` headers are not."""
+    added = removed = 0
+    seen_hunk = False
+    for line in file_diff.splitlines():
+        if line.startswith("@@"):
+            seen_hunk = True
+            continue
+        if not seen_hunk:
+            continue
+        if line.startswith('+'):
+            added += 1
+        elif line.startswith('-'):
+            removed += 1
+    return added, removed
+
+
 def _truncate_file_diff(file_diff, max_chars=MAX_FILE_DIFF_CHARS):
-    """Truncate a single-file diff at hunk boundaries when possible."""
+    """Truncate a single-file diff, preferring a hunk boundary.
+
+    Returns (text, truncated). When at least one hunk boundary falls within
+    the budget we cut there so the model always receives whole hunks.
+    Otherwise we fall back to the last newline before the budget — never a
+    mid-line cut, which would feed the summarizer a malformed diff line."""
     if len(file_diff) <= max_chars:
         return file_diff, False
 
     hunk_markers = [m.start() for m in re.finditer(r"\n@@ ", file_diff)]
     candidate_markers = [pos for pos in hunk_markers if 0 < pos < max_chars]
+    # Cut at the last in-budget hunk boundary only when ≥2 markers fit, so at
+    # least one whole hunk is retained (cutting at a single early marker would
+    # discard the entire body and keep only the file header).
     if len(candidate_markers) >= 2:
-        cut_point = candidate_markers[-1]
-        return file_diff[:cut_point], True
+        return file_diff[:candidate_markers[-1]], True
+
+    # Otherwise fall back to the last newline within budget — a partial final
+    # hunk is still valid, readable diff; a mid-line cut is not.
+    newline = file_diff.rfind("\n", 0, max_chars)
+    if newline > 0:
+        return file_diff[:newline + 1], True
     return file_diff[:max_chars], True
 
 def summarize_file_diff(file_path, file_diff, model_name, prompt_template):
@@ -178,6 +250,7 @@ def apply_additional_instructions(diff_content, instructions_content, model_name
     return _call_prose(prompt, model_name)
 
 _PROOF_RELEVANT_PATTERNS = re.compile(r'\b(sorry|admit|native_decide)\b')
+_SORRY_RE = re.compile(r'\bsorry\b')
 
 def _detect_proof_signals(file_diff):
     """Check if a file diff contains proof-relevant keywords in added/removed lines."""
@@ -189,14 +262,34 @@ def _detect_proof_signals(file_diff):
             signals.update(m.group() for m in _PROOF_RELEVANT_PATTERNS.finditer(line))
     return signals
 
+# Unambiguously non-reviewable files: lockfiles, binaries/media, compiled
+# artifacts. These are filtered deterministically (below) so they never reach
+# the triage model or the summarizer — robust even when a cheap triage model
+# would misjudge them. Anything genuinely ambiguous is left to the LLM.
+_NOISE_BASENAMES = {
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock",
+    "cargo.lock", "uv.lock", "gemfile.lock", "lake-manifest.json", "flake.lock",
+}
+_NOISE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf", ".zip", ".gz",
+    ".tar", ".woff", ".woff2", ".ttf", ".eot", ".olean", ".min.js", ".min.css",
+)
+
+
+def _is_noise_file(path):
+    """True for files that never warrant a summary (lockfiles, binaries,
+    compiled artifacts), identified purely by name/extension."""
+    base = path.rsplit("/", 1)[-1].lower()
+    return base in _NOISE_BASENAMES or base.endswith(_NOISE_EXTENSIONS)
+
+
 def _build_file_list_str(file_paths, diff_by_file, annotate_signals=False):
     """Build a formatted file list with line counts for triage prompts.
     If annotate_signals is True, appends proof-relevant signal tags."""
     file_list_with_counts = []
     for fp in file_paths:
         diff = diff_by_file[fp]
-        added = sum(1 for line in diff.splitlines() if line.startswith('+') and not line.startswith('+++'))
-        removed = sum(1 for line in diff.splitlines() if line.startswith('-') and not line.startswith('---'))
+        added, removed = _count_diff_lines(diff)
         entry = f"{fp} (+{added}/-{removed})"
         if annotate_signals:
             signals = _detect_proof_signals(diff)
@@ -205,15 +298,6 @@ def _build_file_list_str(file_paths, diff_by_file, annotate_signals=False):
         file_list_with_counts.append(entry)
     return "\n".join(file_list_with_counts)
 
-def _ordered_unique(file_paths):
-    seen = set()
-    ordered = []
-    for fp in file_paths:
-        if fp not in seen:
-            seen.add(fp)
-            ordered.append(fp)
-    return ordered
-
 def triage_files(file_paths, diff_by_file, model_name):
     """Uses the AI to filter out noise files before summarization.
     For large PRs, returns (high_priority, low_priority) tuple.
@@ -221,9 +305,17 @@ def triage_files(file_paths, diff_by_file, model_name):
     if not file_paths:
         return [], []
 
-    use_tiered = len(file_paths) > LARGE_PR_FILE_THRESHOLD
-    file_list_str = _build_file_list_str(file_paths, diff_by_file, annotate_signals=use_tiered)
     proof_signal_files = [fp for fp in file_paths if _detect_proof_signals(diff_by_file[fp])]
+    proof_set = set(proof_signal_files)
+    # Drop unambiguous noise deterministically before involving the LLM (a file
+    # with proof signals is never treated as noise). Dropped files fall out of
+    # both tiers and are reported as "filtered as noise" by the caller.
+    candidates = [fp for fp in file_paths if fp in proof_set or not _is_noise_file(fp)]
+    if not candidates:
+        return [], []  # nothing worth triaging — skip the LLM call entirely
+
+    use_tiered = len(candidates) > LARGE_PR_FILE_THRESHOLD
+    file_list_str = _build_file_list_str(candidates, diff_by_file, annotate_signals=use_tiered)
 
     if use_tiered:
         prompt_template = _read_prompt_template("triage_tiered.md")
@@ -236,8 +328,8 @@ def triage_files(file_paths, diff_by_file, model_name):
     try:
         parsed = _call_llm(prompt, model_name, schema)
     except Exception as exc:
-        print(f"Warning: Triage agent failed ({exc}). Proceeding with all files.")
-        return file_paths, []
+        print(f"Warning: Triage agent failed ({exc}). Proceeding with all candidate files.")
+        return candidates, []
 
     if use_tiered:
         high_set = set(parsed.high)
@@ -247,14 +339,14 @@ def triage_files(file_paths, diff_by_file, model_name):
                 print(f"Promoting {fp} to high priority (contains proof-relevant signals).")
             low_set.discard(fp)
             high_set.add(fp)
-        # Preserve original file order from file_paths
-        high = [f for f in file_paths if f in high_set]
-        low = [f for f in file_paths if f in low_set]
+        # Preserve original file order from candidates
+        high = [f for f in candidates if f in high_set]
+        low = [f for f in candidates if f in low_set]
         return high, low
 
-    selected_set = {f for f in parsed.summarize if f in file_paths}
+    selected_set = {f for f in parsed.summarize if f in candidates}
     selected_set.update(proof_signal_files)
-    selected = [f for f in file_paths if f in selected_set]
+    selected = [f for f in candidates if f in selected_set]
     return selected, []
 
 
@@ -289,6 +381,7 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
         groups[group_key].append(s)
 
     # Synthesize each directory group
+    prompt_template = _read_prompt_template("synthesize_summary.md")
     group_summaries = []
     for group_key, summaries in sorted(groups.items()):
         if len(summaries) <= 3:
@@ -296,7 +389,6 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
             group_summaries.extend(summaries)
         else:
             group_text = "\n".join(f"- {s}" for s in summaries)
-            prompt_template = _read_prompt_template("synthesize_summary.md")
             prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
                                     .replace("{{PR_BODY}}", "") \
                                     .replace("{{PER_FILE_SUMMARIES}}", group_text) \
@@ -313,19 +405,6 @@ def synthesize_summary_staged(per_file_summaries, model_name, pr_title, pr_body,
 
     # Final global synthesis
     return synthesize_summary(group_summaries, model_name, pr_title, pr_body, pr_type_hint)
-
-def refine_summary(draft_summary, pr_title, pr_body, model_name):
-    """Refines the final summary using the AI."""
-    prompt_template = _read_prompt_template("refine_summary.md")
-    prompt = prompt_template.replace("{{PR_TITLE}}", pr_title) \
-                            .replace("{{PR_BODY}}", pr_body) \
-                            .replace("{{DRAFT_SUMMARY}}", draft_summary)
-    try:
-        result = _call_prose(prompt, model_name)
-    except Exception as exc:
-        print(f"Warning: Refiner agent failed ({exc}). Falling back to draft summary.")
-        return draft_summary
-    return result or draft_summary
 
 # --- Diff Analysis ---
 class DiffAnalyzer:
@@ -347,19 +426,20 @@ class DiffAnalyzer:
 
         self._current_file = ""
         self._current_old_file = ""
+        self._seen_hunk = False  # True once a @@ hunk header is seen for the current file
         self._old_line_num = 0
         self._new_line_num = 0
-        self._comment_depth = 0  # Lean nested block comment depth
+        self._comment_depth = 0  # Lean nested block comment depth (diff-local fallback)
         self._current_decl_header = ""
         self._current_decl_name = ""
         self._raw_added = {}
         self._raw_removed = {}
         self._raw_added_decls = {}
         self._raw_removed_decls = {}
-        self._new_decl_cache = {}
-        self._old_decl_cache = {}
-        self._current_new_decl_index = ([], [])
-        self._current_old_decl_index = ([], [])
+        self._new_source_cache = {}
+        self._old_source_cache = {}
+        self._current_new_index = self._empty_index()
+        self._current_old_index = self._empty_index()
 
         self._file_path_regex = re.compile(r'diff --git a/(.+) b/(.+)')
         self._hunk_header_regex = re.compile(r'@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@')
@@ -371,38 +451,40 @@ class DiffAnalyzer:
         )
         self._name_extract_regex = re.compile(r'^(?P<name>[^\s\(\{{:\[]+)')
 
-    def analyze(self, diff):
-        """Analyzes the diff and returns the results."""
-        for line in diff.splitlines():
-            if self._parse_file_header(line) or self._parse_hunk_header(line):
-                continue
-
-            if line.startswith("---") or line.startswith("+++"):
-                continue
-
-            # Stats are now collected for ALL files
-            if line.startswith('+'):
-                self.lines_added += 1
-            elif line.startswith('-'):
-                self.lines_removed += 1
-
-            # Lean-specific analysis
-            if self._current_file.endswith(".lean"):
-                self._process_line(line)
-            else:
-                # Still need to increment line numbers for non-Lean files 
-                # if we were tracking something in them, but we aren't.
-                pass
-
-        self._categorize_sorries()
-        self._categorize_decls()
-
-        stats = {
+    @property
+    def stats(self):
+        return {
             "files_changed": len(self.files_changed),
             "lines_added": self.lines_added,
             "lines_removed": self.lines_removed,
         }
-        return stats, self.added_sorries, self.removed_sorries, self.affected_sorries, self.added_decls, self.removed_decls, self.affected_decls, self.warnings
+
+    def analyze(self, diff):
+        """Analyze the diff, populating the result attributes (stats,
+        added/removed/affected sorries and declarations, warnings). Returns
+        self so callers can read those attributes directly."""
+        for line in diff.splitlines():
+            if self._parse_file_header(line) or self._parse_hunk_header(line):
+                continue
+
+            # Skip the per-file header region (the `--- a/...`, `+++ b/...`,
+            # `index`, and mode lines that precede the first hunk). Once a hunk
+            # header has been seen, every +/- line is real content — including a
+            # line whose *content* happens to start with '++' or '--'.
+            if not self._seen_hunk:
+                continue
+
+            # Line stats are collected for all files; Lean analysis only for .lean.
+            if line.startswith('+'):
+                self.lines_added += 1
+            elif line.startswith('-'):
+                self.lines_removed += 1
+            if self._current_file.endswith(".lean"):
+                self._process_line(line)
+
+        self._categorize_sorries()
+        self._categorize_decls()
+        return self
 
     def _parse_file_header(self, line):
         match = self._file_path_regex.match(line)
@@ -410,44 +492,67 @@ class DiffAnalyzer:
             self._current_old_file = match.group(1)
             self._current_file = match.group(2)
             self.files_changed.add(self._current_file)
+            self._seen_hunk = False
             self._comment_depth = 0
             self._current_decl_header = ""
             self._current_decl_name = ""
-            self._current_new_decl_index = self._load_decl_index(self._current_file, is_old=False)
-            self._current_old_decl_index = self._load_decl_index(self._current_old_file, is_old=True)
+            self._current_new_index = self._load_source_index(self._current_file, is_old=False)
+            self._current_old_index = self._load_source_index(self._current_old_file, is_old=True)
             return True
         return False
 
     def _parse_hunk_header(self, line):
         match = self._hunk_header_regex.match(line)
         if match:
+            self._seen_hunk = True
             self._old_line_num = int(match.group(1))
             self._new_line_num = int(match.group(3))
             return True
         return False
 
-    def _load_decl_index(self, file_path, is_old):
-        cache = self._old_decl_cache if is_old else self._new_decl_cache
+    @staticmethod
+    def _empty_index():
+        return {"starts": [], "decls": [], "comment_lines": frozenset(), "available": False}
+
+    def _load_source_index(self, file_path, is_old):
+        """Load and cache a full-source index for a file: declaration positions
+        plus the set of line numbers that lie entirely within comments.
+
+        The comment-line set is computed over the *whole* source file, so it is
+        immune to the cross-hunk depth desync that affects diff-local comment
+        tracking (a block comment opened or closed in an unshown region between
+        hunks). `available` is False when the source could not be loaded, in
+        which case callers fall back to diff-local tracking."""
+        cache = self._old_source_cache if is_old else self._new_source_cache
         if file_path in cache:
             return cache[file_path]
         source = _load_lean_source(file_path, self._base_revision if is_old else None)
-        decls = self._extract_declarations_from_source(source)
-        index = ([d['line'] for d in decls], decls)
+        decls, comment_lines = self._scan_source(source)
+        index = {
+            "starts": [d["line"] for d in decls],
+            "decls": decls,
+            "comment_lines": comment_lines,
+            "available": bool(source),
+        }
         cache[file_path] = index
         return index
 
-    def _extract_declarations_from_source(self, source):
+    def _scan_source(self, source):
+        """Single pass over a source file: collect declarations and the set of
+        line numbers fully inside comments."""
         decls = []
+        comment_lines = set()
         comment_depth = 0
         for line_num, line in enumerate(source.splitlines(), start=1):
             in_comment, comment_depth = is_in_comment(line, comment_depth)
             if in_comment:
+                comment_lines.add(line_num)
                 continue
             stripped = line.lstrip()
             decl_info = self._parse_declaration_line(stripped, line_num)
             if decl_info:
                 decls.append(decl_info)
-        return decls
+        return decls, comment_lines
 
     def _parse_declaration_line(self, stripped_content, line_num):
         match = self._decl_line_regex.match(stripped_content)
@@ -468,8 +573,8 @@ class DiffAnalyzer:
             'line': line_num,
         }
 
-    def _lookup_decl(self, line_num, decl_index):
-        starts, decls = decl_index
+    def _lookup_decl(self, line_num, index):
+        starts, decls = index["starts"], index["decls"]
         if not starts:
             return None
         pos = bisect.bisect_right(starts, line_num) - 1
@@ -479,11 +584,11 @@ class DiffAnalyzer:
 
     def _set_current_decl_from_source(self, line):
         if line.startswith('-'):
-            decl = self._lookup_decl(self._old_line_num, self._current_old_decl_index)
+            decl = self._lookup_decl(self._old_line_num, self._current_old_index)
         else:
-            decl = self._lookup_decl(self._new_line_num, self._current_new_decl_index)
+            decl = self._lookup_decl(self._new_line_num, self._current_new_index)
             if not decl and not line.startswith('+'):
-                decl = self._lookup_decl(self._old_line_num, self._current_old_decl_index)
+                decl = self._lookup_decl(self._old_line_num, self._current_old_index)
         if decl:
             self._current_decl_name = decl['name']
             self._current_decl_header = decl['header']
@@ -497,10 +602,29 @@ class DiffAnalyzer:
         (re.compile(r'set_option\s+autoImplicit\s+true'), "autoImplicit", "`set_option autoImplicit true` re-enabled"),
     ]
 
+    def _line_in_comment(self, line):
+        """Whether this diff line's source line lies entirely within a comment,
+        per the full-source index. Returns None when the relevant source is
+        unavailable, signalling the caller to fall back to diff-local tracking.
+
+        Added/context lines are checked against the new source (at the new line
+        number); removed lines against the old source (at the old line number)."""
+        if line.startswith('-'):
+            index, line_num = self._current_old_index, self._old_line_num
+        else:
+            index, line_num = self._current_new_index, self._new_line_num
+        if not index["available"]:
+            return None
+        return line_num in index["comment_lines"]
+
     def _process_line(self, line):
         # Strip diff marker to get the actual source line for comment detection
         content_line = line[1:] if line.startswith(('+', '-')) else line
-        in_comment, self._comment_depth = is_in_comment(content_line, self._comment_depth)
+        # Keep the diff-local depth coherent so it remains a usable fallback for
+        # files whose source could not be loaded.
+        fallback_in_comment, self._comment_depth = is_in_comment(content_line, self._comment_depth)
+        source_in_comment = self._line_in_comment(line)
+        in_comment = fallback_in_comment if source_in_comment is None else source_in_comment
         self._set_current_decl_from_source(line)
 
         if not in_comment:
@@ -536,7 +660,7 @@ class DiffAnalyzer:
         # Strip diff markers and leading whitespace
         content = line[1:] if line.startswith(('+', '-', ' ')) else line
         stripped_content = content.lstrip()
-        
+
         # Track declarations
         decl_line_num = self._new_line_num if line.startswith('+') else self._old_line_num
         decl_info = self._parse_declaration_line(stripped_content, decl_line_num)
@@ -556,23 +680,26 @@ class DiffAnalyzer:
             elif line.startswith('-'):
                 self._raw_removed_decls[stable_id] = raw_decl
 
-        # Track sorries
-        if 'sorry' in content and self._current_decl_name:
-            # Improved comment detection: -- must be at start of line or preceded by whitespace
+        # Track sorries. Match the `sorry` keyword on a word boundary so
+        # identifiers that merely contain the substring (e.g. `sorryAx`,
+        # `my_sorry_lemma`) don't register as proof obligations. This keeps
+        # detection consistent with _PROOF_RELEVANT_PATTERNS used in triage.
+        sorry_match = _SORRY_RE.search(content)
+        if sorry_match and self._current_decl_name:
+            # Inline comment guard: -- must be at line start or preceded by whitespace
             comment_match = re.search(r'(?:^|\s)--', content)
-            sorry_pos = content.find("sorry")
-            if comment_match and sorry_pos > comment_match.start():
+            if comment_match and sorry_match.start() > comment_match.start():
                 return
-            
+
             stable_id = f"{self._current_decl_name}@{self._current_file}"
             # Unique key for each sorry instance to avoid overwriting
             line_num = self._new_line_num if line.startswith('+') else self._old_line_num
             instance_key = f"{stable_id}#L{line_num}"
-            
+
             sorry_info = {
-                'id': stable_id, 
-                'file': self._current_file, 
-                'name': self._current_decl_name, 
+                'id': stable_id,
+                'file': self._current_file,
+                'name': self._current_decl_name,
                 'header': self._current_decl_header.split(":=")[0].strip() if self._current_decl_header else "unknown"
             }
             if line.startswith('+'):
@@ -581,55 +708,57 @@ class DiffAnalyzer:
             elif line.startswith('-'):
                 sorry_info['line'] = self._old_line_num
                 self._raw_removed[instance_key] = sorry_info
-    
+
     def _categorize_decls(self):
         added_ids, removed_ids = set(self._raw_added_decls.keys()), set(self._raw_removed_decls.keys())
         affected_ids = added_ids.intersection(removed_ids)
         for sid in affected_ids:
             self.affected_decls.append({'id': sid, 'file': self._raw_added_decls[sid]['file'], 'context': self._raw_added_decls[sid]['header'], 'old_line': self._raw_removed_decls[sid]['line'], 'new_line': self._raw_added_decls[sid]['line']})
         for sid in added_ids - affected_ids:
-            self.added_decls.append(f"`{self._raw_added_decls[sid]['header']}` in `{self._raw_added_decls[sid]['file']}`")
+            a = self._raw_added_decls[sid]
+            self.added_decls.append({'file': a['file'], 'header': a['header']})
         for sid in removed_ids - affected_ids:
-            self.removed_decls.append(f"`{self._raw_removed_decls[sid]['header']}` in `{self._raw_removed_decls[sid]['file']}`")
+            r = self._raw_removed_decls[sid]
+            self.removed_decls.append({'file': r['file'], 'header': r['header']})
 
     def _categorize_sorries(self):
         added_by_id = defaultdict(list)
         removed_by_id = defaultdict(list)
-        
+
         for info in self._raw_added.values():
             added_by_id[info['id']].append(info)
-            
+
         for info in self._raw_removed.values():
             removed_by_id[info['id']].append(info)
-            
+
         all_ids = set(added_by_id.keys()).union(removed_by_id.keys())
-        
+
         for sid in all_ids:
             adds = added_by_id[sid]
             rems = removed_by_id[sid]
-            
+
             # Match up to min(len(adds), len(rems)) as "affected"
             match_count = min(len(adds), len(rems))
-            
+
             for i in range(match_count):
                 added_info = adds[i]
                 removed_info = rems[i]
                 self.affected_sorries.append({
-                    'id': added_info['id'], 
-                    'file': added_info['file'], 
-                    'context': added_info['header'], 
-                    'old_line': removed_info['line'], 
+                    'id': added_info['id'],
+                    'file': added_info['file'],
+                    'context': added_info['header'],
+                    'old_line': removed_info['line'],
                     'new_line': added_info['line']
                 })
-                
+
             # Remaining are purely added or removed
             for i in range(match_count, len(adds)):
                 info = adds[i]
-                self.added_sorries.append(f"`{info['header']}` in `{info['file']}` (L{info['line']})")
-                
+                self.added_sorries.append({'file': info['file'], 'header': info['header'], 'line': info['line']})
+
             for i in range(match_count, len(rems)):
                 info = rems[i]
-                self.removed_sorries.append(f"`{info['header']}` in `{info['file']}` (L{info['line']})")
+                self.removed_sorries.append({'file': info['file'], 'header': info['header'], 'line': info['line']})
 
 # --- Caching ---
 def _compute_config_fingerprint(model_name, prompt_template):
@@ -650,16 +779,31 @@ class SummaryCache:
             if CACHE_IDENTIFIER not in comment.body:
                 return {}
             try:
-                cache_str = comment.body.split(CACHE_IDENTIFIER, 1)[1].split("-->", 1)[0]
-                data = json.loads(cache_str)
-                # Invalidate entire cache if config fingerprint changed
-                if data.get("_config") != self._config_fingerprint:
-                    print("Cache invalidated: model or prompt template changed.")
-                    return {}
-                return data
-            except (IndexError, json.JSONDecodeError):
+                payload = comment.body.split(CACHE_IDENTIFIER, 1)[1].split("-->", 1)[0].strip()
+            except IndexError:
                 return {}
+            data = self._decode_cache(payload)
+            if data is None:
+                return {}
+            # Invalidate entire cache if config fingerprint changed
+            if data.get("_config") != self._config_fingerprint:
+                print("Cache invalidated: model or prompt template changed.")
+                return {}
+            return data
         return {}
+
+    @staticmethod
+    def _decode_cache(payload):
+        """Decode an embedded cache payload, or return None if unparseable.
+
+        The payload is base64-encoded JSON: base64's standard alphabet cannot
+        contain '-', so the '-->' HTML-comment terminator can never appear
+        inside the payload and summaries are stored losslessly."""
+        try:
+            raw = base64.b64decode(payload, validate=True).decode("utf-8")
+            return json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
 
     def get(self, file_path, file_diff_hash):
         with self._lock:
@@ -672,11 +816,27 @@ class SummaryCache:
         with self._lock:
             self._cache[file_path] = {'hash': file_diff_hash, 'summary': summary}
 
+    def prune(self, valid_paths):
+        """Drop cached entries for files not present in the current diff.
+
+        The cache is reloaded from the PR comment each run; without pruning it
+        accumulates entries for renamed/removed files indefinitely, bloating the
+        comment (a single long-lived branch can push it past GitHub's size
+        limit). `_config` is not a file entry and is re-added by to_json()."""
+        valid = set(valid_paths)
+        with self._lock:
+            self._cache = {k: v for k, v in self._cache.items() if k in valid}
+
     def to_json(self):
+        """Return the embeddable cache payload (base64-encoded JSON).
+
+        base64 is used so a summary containing '-->' can't truncate the
+        HTML comment the payload lives in. See _decode_cache."""
         with self._lock:
             data = dict(self._cache)
             data["_config"] = self._config_fingerprint
-            return json.dumps(data)
+            raw = json.dumps(data)
+            return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 # --- Comment Formatting ---
 
@@ -690,20 +850,59 @@ def _format_stats_section(stats):
         f"| ❌ **Lines Removed** | {stats['lines_removed']} |\n"
     )
 
+def _format_grouped_entries(entries, line_fmt, cap=MAX_LISTED_DECLS):
+    """Render entries grouped by file for legibility and determinism.
+
+    Files are sorted alphabetically and entries within each file are sorted by
+    their rendered text, so the output is stable across runs (the underlying
+    data comes from set iteration, which is not). Listing stops after `cap`
+    entries with an overflow note, so a PR with hundreds of declarations does
+    not produce an unreadable (or comment-overflowing) wall of text.
+
+    `line_fmt(entry)` returns the per-entry markdown (without the leading bullet)."""
+    total = len(entries)
+    by_file = defaultdict(list)
+    for e in entries:
+        by_file[e['file']].append(e)
+    out = []
+    shown = 0
+    for f in sorted(by_file):
+        group_lines = sorted(line_fmt(e) for e in by_file[f])
+        # Blank line after the file sub-header so the bullet list renders as a
+        # list under strict CommonMark, not a paragraph continuation.
+        out.append(f"\n`{f}` ({len(group_lines)})\n\n")
+        for gl in group_lines:
+            if shown >= cap:
+                out.append(f"\n*…and {total - shown} more not listed.*\n")
+                return "".join(out)
+            out.append(f"*   {gl}\n")
+            shown += 1
+    return "".join(out)
+
+
 def _format_decls_section(added, removed, affected):
     res = "\n---\n\n**Lean Declarations**\n\n"
+    decl_line = lambda e: f"`{e['header']}`"  # noqa: E731
     if removed:
-        res += f"<details><summary>✏️ **Removed:** {len(removed)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+        res += f"<details><summary>✏️ <b>Removed:</b> {len(removed)} declaration(s)</summary>\n" + _format_grouped_entries(removed, decl_line) + "</details>\n"
     if added:
-        res += f"<details><summary>✏️ **Added:** {len(added)} declaration(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+        res += f"<details><summary>✏️ <b>Added:</b> {len(added)} declaration(s)</summary>\n" + _format_grouped_entries(added, decl_line) + "</details>\n"
     if affected:
-        res += f"<details><summary>✏️ **Affected:** {len(affected)} declaration(s) (line number changed)</summary>\n\n"
-        for s in affected:
+        res += f"<details><summary>✏️ <b>Affected:</b> {len(affected)} declaration(s) (line number changed)</summary>\n\n"
+        for s in sorted(affected, key=lambda s: (s['file'], s['context'], s['new_line'])):
             res += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}\n"
         res += "</details>\n"
     if not any([added, removed, affected]):
         res += "*   No declarations were added, removed, or affected.\n"
     return res
+
+def _name_mentioned(name, text):
+    """True if `name` appears in `text` as a standalone token rather than as a
+    substring of a larger identifier. Prevents a short declaration name like
+    `h` from matching inside `hash`. Lean identifier characters (word chars,
+    `.`, `'`) on either side disqualify the match."""
+    return re.search(r"(?<![\w'.])" + re.escape(name) + r"(?![\w'.])", text) is not None
+
 
 def _find_related_issue(sorry_info, issues):
     """Find an issue related to a sorry entry by tracker ID, file path, or declaration name."""
@@ -718,20 +917,23 @@ def _find_related_issue(sorry_info, issues):
         # Exact tracker ID match (strongest signal)
         if f"<!-- sorry-tracker-id: {sid} -->" in issue.body:
             return issue
-        # Match on both file path and declaration name (good signal)
-        if decl_name and decl_name in issue.body and file_path in issue.body:
+        # Match on both file path and declaration name (good signal). The name
+        # must appear as a standalone token, not as a substring of a longer
+        # identifier.
+        if decl_name and _name_mentioned(decl_name, issue.body) and file_path in issue.body:
             return issue
     return None
 
 def _format_sorry_section(added, removed, affected, issues):
     res = "\n---\n\n**`sorry` Tracking**\n\n"
+    sorry_line = lambda e: f"`{e['header']}` (L{e['line']})"  # noqa: E731
     if removed:
-        res += f"<details><summary>✅ **Removed:** {len(removed)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in removed) + "</details>\n"
+        res += f"<details><summary>✅ <b>Removed:</b> {len(removed)} `sorry`(s)</summary>\n" + _format_grouped_entries(removed, sorry_line) + "</details>\n"
     if added:
-        res += f"<details><summary>❌ **Added:** {len(added)} `sorry`(s)</summary>\n\n" + "".join(f"*   {s}\n" for s in added) + "</details>\n"
+        res += f"<details><summary>❌ <b>Added:</b> {len(added)} `sorry`(s)</summary>\n" + _format_grouped_entries(added, sorry_line) + "</details>\n"
     if affected:
-        res += f"<details><summary>✏️ **Affected:** {len(affected)} `sorry`(s) (line number changed)</summary>\n\n"
-        for s in affected:
+        res += f"<details><summary>✏️ <b>Affected:</b> {len(affected)} `sorry`(s) (line number changed)</summary>\n\n"
+        for s in sorted(affected, key=lambda s: (s['file'], s['context'], s['new_line'])):
             related_issue = _find_related_issue(s, issues)
             issue_link = f" (Issue #{related_issue.number})" if related_issue else ""
             res += f"*   `{s['context']}` in `{s['file']}` moved from L{s['old_line']} to L{s['new_line']}{issue_link}\n"
@@ -800,31 +1002,67 @@ def _format_coverage_section(partially_analyzed_files, instructions_skipped):
 
 
 def format_summary(ai_summary, stats, added, removed, affected, added_decls, removed_decls, affected_decls, issues, display_summaries, instructions_report, cache, warnings=None, title_note="", upstream_note="", partially_analyzed_files=None, instructions_skipped=False):
-    """Formats the final summary comment in Markdown."""
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
+    """Formats the final summary comment in Markdown.
+
+    GitHub rejects comment bodies over MAX_COMMENT_CHARS. To stay under the
+    limit we shed content in increasing order of importance: first the embedded
+    cache (regenerable — its loss just causes a full re-summarize next run),
+    then the per-file summaries, then the additional-analysis section, and only
+    as a last resort hard-truncate. The core summary, statistics, and `sorry`
+    tracking are always preserved."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H-%M-%S")
     comment_id = COMMENT_IDENTIFIER.replace("{{timestamp}}", timestamp)
     cache_html = f"{CACHE_IDENTIFIER}{cache.to_json()}-->\n\n" if cache else ""
 
+    header = f"### 🤖 PR Summary\n\n{comment_id}\n\n"
+
     sorry_delta = _format_sorry_delta(added, removed)
-    summary = f"### 🤖 PR Summary\n\n{comment_id}\n\n{cache_html}{title_note}{upstream_note}{sorry_delta}{ai_summary}\n"
-
-    summary += _format_stats_section(stats)
-    summary += _format_decls_section(added_decls, removed_decls, affected_decls)
-    summary += _format_sorry_section(added, removed, affected, issues)
-
+    core = f"{title_note}{upstream_note}{sorry_delta}{ai_summary}\n"
+    core += _format_stats_section(stats)
+    core += _format_decls_section(added_decls, removed_decls, affected_decls)
+    core += _format_sorry_section(added, removed, affected, issues)
     if warnings:
-        summary += _format_warnings_section(warnings)
+        core += _format_warnings_section(warnings)
+    core += _format_coverage_section(partially_analyzed_files or [], instructions_skipped)
 
-    summary += _format_coverage_section(partially_analyzed_files or [], instructions_skipped)
-
+    instructions_section = ""
     if instructions_report:
-        summary += f"\n---\n\n<details><summary>📋 **Additional Analysis**</summary>\n\n{instructions_report}\n</details>\n"
-    
+        instructions_section = f"\n---\n\n<details><summary>📋 **Additional Analysis**</summary>\n\n{instructions_report}\n</details>\n"
+
+    per_file_section = ""
     if display_summaries:
-        summary += "\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
-    
-    summary += f"\n---\n\n*Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}.*"
-    return summary
+        per_file_section = "\n---\n\n<details><summary>📄 **Per-File Summaries**</summary>\n\n" + "".join(f"*   {s}\n" for s in display_summaries) + "</details>\n"
+
+    footer = f"\n---\n\n*Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.*"
+
+    def assemble(include_cache, include_per_file, include_instructions, note=""):
+        parts = [header]
+        if include_cache:
+            parts.append(cache_html)
+        parts.append(note)
+        parts.append(core)
+        if include_instructions:
+            parts.append(instructions_section)
+        if include_per_file:
+            parts.append(per_file_section)
+        parts.append(footer)
+        return "".join(parts)
+
+    candidate = assemble(True, True, True)
+    if len(candidate) <= MAX_COMMENT_CHARS:
+        return candidate
+
+    omit_note = "> ℹ️ Some sections were omitted to fit GitHub's comment size limit.\n\n"
+    # Shed in order: embedded cache, then per-file summaries, then additional analysis.
+    for include_per_file, include_instructions in ((True, True), (False, True), (False, False)):
+        note = omit_note if not (include_per_file and include_instructions) else ""
+        candidate = assemble(False, include_per_file, include_instructions, note)
+        if len(candidate) <= MAX_COMMENT_CHARS:
+            return candidate
+
+    # Last resort: hard-truncate the (cache-free, sections-dropped) body.
+    trunc_note = "\n\n> ⚠️ Summary truncated to fit GitHub's comment size limit."
+    return candidate[:MAX_COMMENT_CHARS - len(trunc_note)].rstrip() + trunc_note
 
 def find_sorry_issues(repo: Repository):
     """Finds all open issues with the 'proof wanted' label."""
@@ -879,26 +1117,31 @@ def main():
     """Main execution block."""
     global _provider
 
-    # Initialize LLM provider
-    provider_name = os.environ.get("PROVIDER", "gemini")
+    # Initialize LLM provider (OpenRouter-backed). API_KEY holds the OpenRouter key.
     api_key = os.getenv("API_KEY")
     if not api_key:
-        # Per-provider fallbacks
-        fallback_keys = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-        fallback = fallback_keys.get(provider_name.lower(), "")
-        if fallback:
-            api_key = os.getenv(fallback)
-    if not api_key:
-        sys.exit(f"Error: API_KEY not set. Set API_KEY or the provider-specific key for '{provider_name}'.")
+        sys.exit("Error: API_KEY not set (expects an OpenRouter API key).")
 
-    _provider = create_provider(provider_name, api_key)
+    # Optional global reasoning effort, applied to every API call. Default off
+    # (empty) preserves the model's own default. OpenRouter accepts low/medium/high.
+    reasoning_effort = os.environ.get("INPUT_REASONING_EFFORT", "")
+    provider_kwargs = _reasoning_kwargs(reasoning_effort)
+    if reasoning_effort.strip() and not provider_kwargs:
+        print(f"Warning: ignoring unrecognized reasoning_effort '{reasoning_effort.strip()}' (expected low/medium/high).")
+
+    _provider = create_provider(api_key, **provider_kwargs)
     logging.info(f"Using LLM provider: {_provider.name}")
+    if provider_kwargs:
+        logging.info(f"Reasoning effort: {reasoning_effort.strip().lower()}")
 
-    model_name = os.environ.get("INPUT_MODEL", 'gemini-3-flash-preview')
+    # Model is an OpenRouter slug, e.g. "anthropic/claude-opus-4.8".
+    model_name = os.environ.get("INPUT_MODEL", 'anthropic/claude-haiku-4.5')
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
     instructions_path = os.environ.get("INPUT_ADDITIONAL_INSTRUCTIONS_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
     upstream_path = os.environ.get("INPUT_UPSTREAM_PATH", "")
+    max_file_diff_chars = _positive_int(os.environ.get("INPUT_MAX_FILE_DIFF_CHARS"), MAX_FILE_DIFF_CHARS)
+    max_instructions_diff_chars = _positive_int(os.environ.get("INPUT_MAX_INSTRUCTIONS_DIFF_CHARS"), MAX_INSTRUCTIONS_DIFF_CHARS)
 
     try:
         with open("pr.diff", "r") as f:
@@ -907,7 +1150,7 @@ def main():
         sys.exit("Error: pr.diff not found.")
 
     analyzer = DiffAnalyzer(keywords, base_revision=os.environ.get("MERGE_BASE"))
-    stats, added, removed, affected, added_decls, removed_decls, affected_decls, warnings = analyzer.analyze(diff)
+    analyzer.analyze(diff)
 
     repo, pr, issues, pr_title, pr_body = None, None, [], "", ""
     if "GITHUB_TOKEN" in os.environ:
@@ -967,19 +1210,18 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         instructions_future = None
         if instructions_content:
-            if len(diff) <= MAX_INSTRUCTIONS_DIFF_CHARS:
+            if len(diff) <= max_instructions_diff_chars:
                 instructions_future = executor.submit(apply_additional_instructions, diff, instructions_content, model_name, instructions_template)
             else:
                 instructions_skipped = True
 
         future_to_file = {}
         for fp in files_to_summarize:
-            fd, was_truncated = _truncate_file_diff(diff_by_file[fp], MAX_FILE_DIFF_CHARS)
+            fd, was_truncated = _truncate_file_diff(diff_by_file[fp], max_file_diff_chars)
             file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
             cached_summary = cache.get(fp, file_diff_hash) if cache else None
             if was_truncated:
-                added_count = sum(1 for line in diff_by_file[fp].splitlines() if line.startswith('+') and not line.startswith('+++'))
-                removed_count = sum(1 for line in diff_by_file[fp].splitlines() if line.startswith('-') and not line.startswith('---'))
+                added_count, removed_count = _count_diff_lines(diff_by_file[fp])
                 partially_analyzed_files.append({'file': fp, 'added': added_count, 'removed': removed_count})
 
             if cached_summary:
@@ -1021,51 +1263,59 @@ def main():
 
     # Add low-priority files as brief mentions (no AI call)
     for fp in low_priority:
-        fd = diff_by_file[fp]
-        added_count = sum(1 for line in fd.splitlines() if line.startswith('+') and not line.startswith('+++'))
-        removed_count = sum(1 for line in fd.splitlines() if line.startswith('-') and not line.startswith('---'))
+        added_count, removed_count = _count_diff_lines(diff_by_file[fp])
         entry = f"**{fp}**: *(minor changes, +{added_count}/-{removed_count})*"
         synthesis_inputs.append(entry)
         display_summaries.append(entry)
+
+    # Never silently drop files: list anything triaged out entirely, so the
+    # file count reconciles and nothing is invisible to a reviewer. Kept out of
+    # synthesis_inputs so the overview isn't padded with noise.
+    summarized = set(files_to_summarize) | set(low_priority)
+    dropped = [fp for fp in all_files if fp not in summarized]
+    if dropped:
+        preview = ", ".join(f"`{fp}`" for fp in dropped[:12])
+        if len(dropped) > 12:
+            preview += f", …(+{len(dropped) - 12} more)"
+        display_summaries.append(
+            f"*{len(dropped)} file(s) filtered as noise (lockfiles, generated, or trivial): {preview}*"
+        )
 
     try:
         # Use two-stage synthesis for very large PRs
         if len(synthesis_inputs) > LARGE_PR_SYNTHESIS_THRESHOLD:
             print(f"Large PR detected ({len(synthesis_inputs)} summaries). Using two-stage synthesis.")
-            draft_summary = synthesize_summary_staged(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
+            ai_summary = synthesize_summary_staged(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
         else:
-            draft_summary = synthesize_summary(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
+            ai_summary = synthesize_summary(synthesis_inputs, model_name, pr_title, pr_body, pr_type_hint)
     except Exception as e:
         print(f"Error synthesizing final summary: {e}")
-        # Create a fallback summary if synthesis fails
-        draft_summary = "Failed to generate AI summary. Please check the per-file summaries and statistics below."
+        # Fallback if synthesis fails
+        ai_summary = "Failed to generate AI summary. Please check the per-file summaries and statistics below."
 
-    try:
-        ai_summary = refine_summary(draft_summary, pr_title, pr_body, model_name)
-    except Exception as e:
-        print(f"Warning: Refiner agent failed. Using draft summary. {e}")
-        ai_summary = draft_summary
+    if cache:
+        cache.prune(all_files)
 
     final_summary = format_summary(
         ai_summary,
-        stats,
-        added,
-        removed,
-        affected,
-        added_decls,
-        removed_decls,
-        affected_decls,
+        analyzer.stats,
+        analyzer.added_sorries,
+        analyzer.removed_sorries,
+        analyzer.affected_sorries,
+        analyzer.added_decls,
+        analyzer.removed_decls,
+        analyzer.affected_decls,
         issues,
         display_summaries,
         instructions_report,
         cache,
-        warnings,
+        analyzer.warnings,
         title_note,
         upstream_note,
         partially_analyzed_files,
         instructions_skipped,
     )
-    
+
     if pr:
         post_github_comment(pr, final_summary)
     elif "GITHUB_TOKEN" in os.environ:
