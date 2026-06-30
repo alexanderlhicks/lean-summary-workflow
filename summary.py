@@ -1134,8 +1134,9 @@ def main():
     if provider_kwargs:
         logging.info(f"Reasoning effort: {reasoning_effort.strip().lower()}")
 
-    # Model is an OpenRouter slug, e.g. "anthropic/claude-opus-4.8".
-    model_name = os.environ.get("INPUT_MODEL", 'anthropic/claude-haiku-4.5')
+    # Model is an OpenRouter slug. Falls back to the action's default if unset
+    # or empty (action.yml sets the same default).
+    model_name = os.environ.get("INPUT_MODEL") or 'deepseek/deepseek-v4-flash'
     keywords = [k.strip() for k in os.environ.get("INPUT_LEAN_KEYWORDS", 'def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom').split(',')]
     instructions_path = os.environ.get("INPUT_ADDITIONAL_INSTRUCTIONS_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"

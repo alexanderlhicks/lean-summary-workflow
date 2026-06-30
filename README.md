@@ -73,9 +73,10 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.OPENROUTER_KEY }}
-          model: google/gemini-3-flash-preview   # any OpenRouter slug — see the table below
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
+          # model defaults to deepseek/deepseek-v4-flash — uncomment to override:
+          # model: google/gemma-4-26b-a4b-it
           # Optional:
           # additional_instructions_path: 'CONTRIBUTING.md'   # style guide / progress tracker / cross-check
           # validate_title: 'true'                            # enforce conventional-commit titles
@@ -87,27 +88,11 @@ jobs:
 
 > **Why `pull_request_target`?** It lets the workflow run for fork PRs *with* access to secrets (the `pull_request` event gives fork-triggered runs a read-only token and no secrets). The job runs from your **default branch**, not the PR branch — so this is also why a workflow change only takes effect once merged to the default branch. The action is safe here because it only *reads* the diff (checked out at `pull_request.head.sha`) and posts a comment; it never executes code from the PR branch. If you don't accept fork PRs, you can switch the trigger to `pull_request` with no other changes.
 
-### 3. Choose a model
+### 3. Model
 
-Any OpenRouter slug works. The pipeline is light (triage, short per-file summaries, one synthesis), so a **cheap instruction-following model is the sweet spot**. Verified candidates (prices per 1M tokens, input/output):
+The action defaults to **`deepseek/deepseek-v4-flash`**, so you don't need to set `model` at all. It's a strong fit for this pipeline: cheap (≈ $0.09 / $0.18 per 1M input/output tokens), a 1M-token context window (even large PRs fit comfortably), capable on technical/Lean content, and it advertises full structured-output (JSON-schema) support — which the triage and per-file summarizer steps rely on.
 
-| Slug | Context | In / Out | Notes |
-|---|---|---|---|
-| `google/gemma-4-26b-a4b-it` | 256k | $0.06 / $0.33 | Cheapest capable; great default for cost. |
-| `openai/gpt-5-nano` | 400k | $0.05 / $0.40 | Cheapest overall, large context, reliable JSON. |
-| `qwen/qwen3-235b-a22b-2507` | 256k | $0.09 / $0.10 | Very low output cost; strong. |
-| `mistralai/mistral-small-3.2-24b-instruct` | 128k | $0.08 / $0.20 | Cheap and solid. |
-| `deepseek/deepseek-chat-v3.1` | 164k | $0.21 / $0.79 | Strong, mid-cheap. |
-| `google/gemini-3.1-flash-lite` | 1M | $0.25 / $1.50 | Huge context, mid-cheap. |
-| `openai/gpt-5-mini` | 400k | $0.25 / $2.00 | Very reliable structured output. |
-| `google/gemini-3-flash-preview` | 1M | $0.50 / $3.00 | Capable, large context. |
-| `anthropic/claude-haiku-4.5` | 200k | $1.00 / $5.00 | Most reliable structured output; priciest of the cheap tier. |
-
-Guidance:
-- **Lowest cost:** `google/gemma-4-26b-a4b-it`, `openai/gpt-5-nano`, or `qwen/qwen3-235b-a22b-2507`.
-- **Most reliable structured output** (triage and per-file summaries use schema-validated JSON): `anthropic/claude-haiku-4.5`, `openai/gpt-5-mini`, `google/gemini-3-flash-preview`. The action enables OpenRouter's response-healing for malformed JSON, but if a very cheap model's triage step misbehaves, move up a tier.
-- **Reasoning effort** (`reasoning_effort`) is honored by reasoning-capable models (GPT-5, Gemini 3) and silently ignored by others (Gemma, Qwen, Mistral).
-- Run `curl -s https://openrouter.ai/api/v1/models` for the current catalogue and live pricing.
+To use a different model, set the `model` input to any [OpenRouter slug](https://openrouter.ai/models) (run `curl -s https://openrouter.ai/api/v1/models` for the live catalogue and pricing). Triage and per-file summaries use schema-validated JSON, so prefer a model that advertises `structured_outputs` (most current instruction-following models do; the action also enables OpenRouter's response-healing as a fallback). `reasoning_effort` is honored by reasoning-capable models and silently ignored by the rest.
 
 ### 4. Size the diff budgets to your model (optional)
 
@@ -123,7 +108,7 @@ Open or push to a PR. The action posts (and thereafter updates) a single **🤖 
 |---|---|---|---|
 | `github_token` | GitHub token for API calls. Should be set to `${{ secrets.GITHUB_TOKEN }}`. | Yes | |
 | `api_key` | OpenRouter API key. Store as a repository secret. | Yes | |
-| `model` | OpenRouter model slug (e.g., `anthropic/claude-opus-4.8`, `google/gemini-3-pro-preview`, `openai/gpt-5`). | Yes | |
+| `model` | OpenRouter model slug. Omit to use the default; override with any slug (e.g., `google/gemma-4-26b-a4b-it`, `openai/gpt-5-mini`). | No | `deepseek/deepseek-v4-flash` |
 | `github_repository` | The GitHub repository in `owner/repo` format. | Yes | |
 | `pr_number` | The pull request number. | Yes | |
 | `lean_keywords` | Comma-separated list of Lean declaration keywords to track for sorry attribution. | No | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |

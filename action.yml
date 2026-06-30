@@ -14,8 +14,9 @@ inputs:
     description: 'The Pull Request number'
     required: true
   model:
-    description: 'OpenRouter model slug (e.g., anthropic/claude-opus-4.8, google/gemini-3-pro-preview, openai/gpt-5)'
-    required: true
+    description: 'OpenRouter model slug. Defaults to deepseek/deepseek-v4-flash; override with any slug (e.g., google/gemma-4-26b-a4b-it, openai/gpt-5-mini).'
+    required: false
+    default: 'deepseek/deepseek-v4-flash'
   lean_keywords:
     description: 'Comma-separated list of Lean keywords (e.g., theorem, def) to track for declaration changes and sorries'
     required: false
