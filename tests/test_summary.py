@@ -411,6 +411,15 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary._reasoning_kwargs(None), {})
         self.assertEqual(summary._reasoning_kwargs("turbo"), {})
 
+    def test_positive_int_parses_or_falls_back(self):
+        self.assertEqual(summary._positive_int("120000", 60000), 120000)
+        # Empty / missing / non-numeric / non-positive all fall back to default.
+        self.assertEqual(summary._positive_int("", 60000), 60000)
+        self.assertEqual(summary._positive_int(None, 60000), 60000)
+        self.assertEqual(summary._positive_int("abc", 60000), 60000)
+        self.assertEqual(summary._positive_int("0", 60000), 60000)
+        self.assertEqual(summary._positive_int("-5", 60000), 60000)
+
     def test_find_related_issue_tracker_id_wins(self):
         sorry_info = {"id": "lemA@Foo.lean", "file": "Foo.lean"}
         issues = [types.SimpleNamespace(body="<!-- sorry-tracker-id: lemA@Foo.lean -->", number=7)]

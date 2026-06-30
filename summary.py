@@ -50,13 +50,21 @@ class _TriageTiered(BaseModel):
     )
 
 # --- Constants ---
-MAX_FILE_DIFF_CHARS = 60_000  # ~15-20k tokens; a single file's diff above this is truncated (with a coverage note)
-# Cap on the whole-PR diff sent to the additional-instructions agent in one
-# call. Sized to fit comfortably inside a cheap ~128k-token model (≈4 chars/
-# token) alongside the instructions file and the response; above this the
-# analysis is skipped (a partial result would mislead). Lower for a
-# smaller-context model. The old 1.5M-char value exceeded most cheap models'
-# context windows, so those calls failed rather than ran.
+# Defaults for the diff-size budgets; both are overridable via action inputs
+# (INPUT_MAX_FILE_DIFF_CHARS / INPUT_MAX_INSTRUCTIONS_DIFF_CHARS). Rough sizing
+# guide: typical Lean averages ~50 chars/line (a mix of short tactic lines and
+# longer signatures), and ~4 chars ≈ 1 token, so 1,000 lines ≈ 50,000 chars
+# ≈ ~12k tokens.
+#
+# Per-file diff sent to the summarizer; above this it is truncated at a hunk
+# boundary (with a coverage note). 60,000 chars ≈ ~1,200 lines ≈ ~15k tokens.
+MAX_FILE_DIFF_CHARS = 60_000
+# Whole-PR diff sent to the additional-instructions agent in one call; above
+# this the analysis is skipped (a partial result would mislead). Must fit the
+# model's context alongside the instructions file and the response. 400,000
+# chars ≈ ~8,000 changed lines ≈ ~100k tokens (fits a ~128k-token model). The
+# old 1.5M default exceeded most cheap models' context, so those calls failed
+# rather than ran. Lower for a smaller-context model.
 MAX_INSTRUCTIONS_DIFF_CHARS = 400_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
@@ -108,6 +116,16 @@ def _reasoning_kwargs(reasoning_effort):
     if effort in ("low", "medium", "high"):
         return {"reasoning_default": {"effort": effort}}
     return {}
+
+
+def _positive_int(value, default):
+    """Parse a positive int from an action-input string; fall back to `default`
+    on empty, missing, non-numeric, or non-positive input."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _call_llm(prompt, model_name, schema):
@@ -1122,6 +1140,8 @@ def main():
     instructions_path = os.environ.get("INPUT_ADDITIONAL_INSTRUCTIONS_PATH")
     validate_title = os.environ.get("INPUT_VALIDATE_TITLE", "false").lower() == "true"
     upstream_path = os.environ.get("INPUT_UPSTREAM_PATH", "")
+    max_file_diff_chars = _positive_int(os.environ.get("INPUT_MAX_FILE_DIFF_CHARS"), MAX_FILE_DIFF_CHARS)
+    max_instructions_diff_chars = _positive_int(os.environ.get("INPUT_MAX_INSTRUCTIONS_DIFF_CHARS"), MAX_INSTRUCTIONS_DIFF_CHARS)
 
     try:
         with open("pr.diff", "r") as f:
@@ -1190,14 +1210,14 @@ def main():
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         instructions_future = None
         if instructions_content:
-            if len(diff) <= MAX_INSTRUCTIONS_DIFF_CHARS:
+            if len(diff) <= max_instructions_diff_chars:
                 instructions_future = executor.submit(apply_additional_instructions, diff, instructions_content, model_name, instructions_template)
             else:
                 instructions_skipped = True
 
         future_to_file = {}
         for fp in files_to_summarize:
-            fd, was_truncated = _truncate_file_diff(diff_by_file[fp], MAX_FILE_DIFF_CHARS)
+            fd, was_truncated = _truncate_file_diff(diff_by_file[fp], max_file_diff_chars)
             file_diff_hash = hashlib.sha256(fd.encode()).hexdigest()
             cached_summary = cache.get(fp, file_diff_hash) if cache else None
             if was_truncated:

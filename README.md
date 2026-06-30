@@ -91,6 +91,8 @@ jobs:
 | `reasoning_effort` | Reasoning/thinking effort applied to every model call: `low`, `medium`, or `high`. Empty uses the model default. Ignored by models without reasoning support. | No | `` |
 | `validate_title` | Validate PR title against conventional commit format: `type[(scope)]: subject`. | No | `false` |
 | `upstream_path` | Path prefix for upstream-bound files. If changed files match, a reminder is shown. | No | |
+| `max_file_diff_chars` | Max characters of a single file's diff sent to the summarizer before it is truncated at a hunk boundary. Rough guide: Lean averages ~50 chars/line (~4 chars/token), so `60000` ≈ ~1,200 lines ≈ ~15k tokens. Lower for a smaller-context model. | No | `60000` |
+| `max_instructions_diff_chars` | Max characters of the whole-PR diff sent to the additional-instructions agent in one call; above this the analysis is skipped. Must fit the model's context alongside the instructions file and response. Rough guide: `400000` ≈ ~8,000 changed lines ≈ ~100k tokens (fits a ~128k-token model). Lower for a smaller-context model. | No | `400000` |
 
 ## Project Structure
 

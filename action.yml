@@ -36,6 +36,25 @@ inputs:
     description: 'Path prefix for upstream-bound files (e.g., ToMathlib/). If changed files match, a reminder is shown.'
     required: false
     default: ''
+  max_file_diff_chars:
+    description: >-
+      Max characters of a single file's diff sent to the summarizer before it
+      is truncated at a hunk boundary (with a coverage note). Rough guide: Lean
+      averages ~50 chars/line and ~4 chars/token, so the 60000 default ≈ ~1200
+      lines ≈ ~15k tokens. Raise to truncate large files less (higher token
+      cost); lower for a smaller-context model.
+    required: false
+    default: '60000'
+  max_instructions_diff_chars:
+    description: >-
+      Max characters of the whole-PR diff sent to the additional-instructions
+      agent in one call; above this the analysis is skipped (a partial result
+      would mislead). Must fit the model's context alongside the instructions
+      file and the response. Rough guide: ~50 chars/line, so the 400000 default
+      ≈ ~8000 changed lines ≈ ~100k tokens (fits a ~128k-token model). Lower for
+      a smaller-context model.
+    required: false
+    default: '400000'
 runs:
   using: "composite"
   steps:
@@ -86,6 +105,8 @@ runs:
         INPUT_ADDITIONAL_INSTRUCTIONS_PATH: ${{ inputs.additional_instructions_path }}
         INPUT_VALIDATE_TITLE: ${{ inputs.validate_title }}
         INPUT_UPSTREAM_PATH: ${{ inputs.upstream_path }}
+        INPUT_MAX_FILE_DIFF_CHARS: ${{ inputs.max_file_diff_chars }}
+        INPUT_MAX_INSTRUCTIONS_DIFF_CHARS: ${{ inputs.max_instructions_diff_chars }}
         # MERGE_BASE is set in the preceding "Generate diff" step via
         # `echo "MERGE_BASE=..." >> "$GITHUB_ENV"`. Re-declaring it here
         # makes the dependency explicit (the CI env-var consistency check
