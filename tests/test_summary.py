@@ -102,6 +102,29 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("Proof.lean", high)
         self.assertNotIn("Proof.lean", low)
 
+    def test_triage_filters_deterministic_noise_before_llm(self):
+        diff_by_file = {
+            "A.lean": "diff --git a/A.lean b/A.lean\n@@ -1 +1 @@\n+theorem t := by trivial\n",
+            "pnpm-lock.yaml": "diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n@@ -1 +1 @@\n+lock\n",
+            "logo.png": "diff --git a/logo.png b/logo.png\n@@ -1 +1 @@\n+bin\n",
+        }
+        resp = summary._TriageSimple(summarize=["A.lean", "pnpm-lock.yaml"])
+        with mock.patch.object(summary, "_call_llm", return_value=resp):
+            selected, low = summary.triage_files(list(diff_by_file), diff_by_file, "m")
+        # Noise is dropped deterministically even if the LLM tries to keep it.
+        self.assertEqual(selected, ["A.lean"])
+        self.assertNotIn("pnpm-lock.yaml", selected)
+        self.assertNotIn("logo.png", selected)
+
+    def test_triage_skips_llm_when_only_noise(self):
+        diff_by_file = {
+            "uv.lock": "diff --git a/uv.lock b/uv.lock\n@@ -1 +1 @@\n+x\n",
+            "a.png": "diff --git a/a.png b/a.png\n@@ -1 +1 @@\n+x\n",
+        }
+        with mock.patch.object(summary, "_call_llm", side_effect=AssertionError("must not call LLM")):
+            selected, low = summary.triage_files(list(diff_by_file), diff_by_file, "m")
+        self.assertEqual((selected, low), ([], []))
+
     def test_triage_falls_back_to_all_files_on_provider_failure(self):
         diff_by_file = {
             "Proof.lean": "diff --git a/Proof.lean b/Proof.lean\n+  sorry\n",

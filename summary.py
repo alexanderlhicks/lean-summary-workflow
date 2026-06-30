@@ -51,7 +51,13 @@ class _TriageTiered(BaseModel):
 
 # --- Constants ---
 MAX_FILE_DIFF_CHARS = 60_000  # ~15-20k tokens; a single file's diff above this is truncated (with a coverage note)
-MAX_INSTRUCTIONS_DIFF_CHARS = 1_500_000
+# Cap on the whole-PR diff sent to the additional-instructions agent in one
+# call. Sized to fit comfortably inside a cheap ~128k-token model (≈4 chars/
+# token) alongside the instructions file and the response; above this the
+# analysis is skipped (a partial result would mislead). Lower for a
+# smaller-context model. The old 1.5M-char value exceeded most cheap models'
+# context windows, so those calls failed rather than ran.
+MAX_INSTRUCTIONS_DIFF_CHARS = 400_000
 LARGE_PR_FILE_THRESHOLD = 50  # Files to summarize above which tiered mode activates
 LARGE_PR_SYNTHESIS_THRESHOLD = 40  # Per-file summaries above which two-stage synthesis activates
 COMMENT_IDENTIFIER = "<!-- lean-pr-summary-{{timestamp}} -->"
@@ -238,6 +244,27 @@ def _detect_proof_signals(file_diff):
             signals.update(m.group() for m in _PROOF_RELEVANT_PATTERNS.finditer(line))
     return signals
 
+# Unambiguously non-reviewable files: lockfiles, binaries/media, compiled
+# artifacts. These are filtered deterministically (below) so they never reach
+# the triage model or the summarizer — robust even when a cheap triage model
+# would misjudge them. Anything genuinely ambiguous is left to the LLM.
+_NOISE_BASENAMES = {
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock",
+    "cargo.lock", "uv.lock", "gemfile.lock", "lake-manifest.json", "flake.lock",
+}
+_NOISE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf", ".zip", ".gz",
+    ".tar", ".woff", ".woff2", ".ttf", ".eot", ".olean", ".min.js", ".min.css",
+)
+
+
+def _is_noise_file(path):
+    """True for files that never warrant a summary (lockfiles, binaries,
+    compiled artifacts), identified purely by name/extension."""
+    base = path.rsplit("/", 1)[-1].lower()
+    return base in _NOISE_BASENAMES or base.endswith(_NOISE_EXTENSIONS)
+
+
 def _build_file_list_str(file_paths, diff_by_file, annotate_signals=False):
     """Build a formatted file list with line counts for triage prompts.
     If annotate_signals is True, appends proof-relevant signal tags."""
@@ -260,9 +287,17 @@ def triage_files(file_paths, diff_by_file, model_name):
     if not file_paths:
         return [], []
 
-    use_tiered = len(file_paths) > LARGE_PR_FILE_THRESHOLD
-    file_list_str = _build_file_list_str(file_paths, diff_by_file, annotate_signals=use_tiered)
     proof_signal_files = [fp for fp in file_paths if _detect_proof_signals(diff_by_file[fp])]
+    proof_set = set(proof_signal_files)
+    # Drop unambiguous noise deterministically before involving the LLM (a file
+    # with proof signals is never treated as noise). Dropped files fall out of
+    # both tiers and are reported as "filtered as noise" by the caller.
+    candidates = [fp for fp in file_paths if fp in proof_set or not _is_noise_file(fp)]
+    if not candidates:
+        return [], []  # nothing worth triaging — skip the LLM call entirely
+
+    use_tiered = len(candidates) > LARGE_PR_FILE_THRESHOLD
+    file_list_str = _build_file_list_str(candidates, diff_by_file, annotate_signals=use_tiered)
 
     if use_tiered:
         prompt_template = _read_prompt_template("triage_tiered.md")
@@ -275,8 +310,8 @@ def triage_files(file_paths, diff_by_file, model_name):
     try:
         parsed = _call_llm(prompt, model_name, schema)
     except Exception as exc:
-        print(f"Warning: Triage agent failed ({exc}). Proceeding with all files.")
-        return file_paths, []
+        print(f"Warning: Triage agent failed ({exc}). Proceeding with all candidate files.")
+        return candidates, []
 
     if use_tiered:
         high_set = set(parsed.high)
@@ -286,14 +321,14 @@ def triage_files(file_paths, diff_by_file, model_name):
                 print(f"Promoting {fp} to high priority (contains proof-relevant signals).")
             low_set.discard(fp)
             high_set.add(fp)
-        # Preserve original file order from file_paths
-        high = [f for f in file_paths if f in high_set]
-        low = [f for f in file_paths if f in low_set]
+        # Preserve original file order from candidates
+        high = [f for f in candidates if f in high_set]
+        low = [f for f in candidates if f in low_set]
         return high, low
 
-    selected_set = {f for f in parsed.summarize if f in file_paths}
+    selected_set = {f for f in parsed.summarize if f in candidates}
     selected_set.update(proof_signal_files)
-    selected = [f for f in file_paths if f in selected_set]
+    selected = [f for f in candidates if f in selected_set]
     return selected, []
 
 
