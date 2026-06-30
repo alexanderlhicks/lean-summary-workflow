@@ -35,9 +35,18 @@ For pull requests with multiple file changes, the action employs a hierarchical 
 7.  **Synthesis:** The Synthesis Agent generates a structured, self-contained overview from per-file summaries, PR title, and body. For very large PRs (40+ summaries), uses two-stage synthesis: per-directory groups first, then global. Files triaged out entirely are still noted, so the file count reconciles and nothing is invisible.
 8.  **Post Comment:** The final summary (including sorry delta, statistics, declaration changes, quality signals, coverage notes, additional analysis, and per-file summaries) is posted as a PR comment. Declaration and `sorry` listings are grouped by file, sorted deterministically, and capped with an overflow note on very large PRs. The comment body is kept under GitHub's size limit by shedding regenerable content (cache, then per-file summaries) if needed. Previous summary comments are found and updated.
 
-## Usage
+## Deployment
 
-Create a workflow file at `.github/workflows/pr_summary.yml`:
+### 1. Add your OpenRouter API key
+
+The action reaches every model through OpenRouter's OpenAI-compatible endpoint (`https://openrouter.ai/api/v1`), selected purely by model slug — there is no per-provider setup.
+
+1. Create an API key at <https://openrouter.ai/keys>.
+2. Add it as a repository (or organization) **Actions secret**. These docs use the name **`OPENROUTER_KEY`**; if you pick another name, update the `api_key` line in the workflow below.
+
+### 2. Add the workflow
+
+Create `.github/workflows/summary.yml`:
 
 ```yaml
 name: 'PR Summary'
@@ -51,9 +60,9 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
-  pull-requests: write
-  issues: read
+  contents: read        # required: the action checks out the PR head to read the diff
+  pull-requests: write  # required: post/update the summary comment
+  issues: read          # optional: link affected sorries to `proof wanted` issues
 
 jobs:
   summarize:
@@ -63,19 +72,35 @@ jobs:
         uses: alexanderlhicks/lean-summary-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          api_key: ${{ secrets.OPENROUTER_API_KEY }}
-          model: anthropic/claude-haiku-4.5  # any OpenRouter slug, e.g. google/gemini-3-flash-preview, openai/gpt-5-mini
+          api_key: ${{ secrets.OPENROUTER_KEY }}
           github_repository: ${{ github.repository }}
           pr_number: ${{ github.event.pull_request.number }}
+          # model defaults to deepseek/deepseek-v4-flash — uncomment to override:
+          # model: google/gemma-4-26b-a4b-it
           # Optional:
-          # additional_instructions_path: 'CONTRIBUTING.md'
-          # validate_title: 'true'
-          # upstream_path: 'ToMathlib/'
+          # additional_instructions_path: 'CONTRIBUTING.md'   # style guide / progress tracker / cross-check
+          # validate_title: 'true'                            # enforce conventional-commit titles
+          # upstream_path: 'ToMathlib/'                       # remind about upstream-bound files
+          # reasoning_effort: 'low'                           # low|medium|high; default off (ignored by non-reasoning models)
+          # max_file_diff_chars: '60000'                      # per-file diff budget (~1,200 Lean lines)
+          # max_instructions_diff_chars: '400000'             # whole-PR budget for the instructions agent (~100k tokens)
 ```
 
-> **Note on the trigger:** This example uses `pull_request_target` so the workflow also runs for PRs from forks (the `pull_request` event does not expose repository secrets to fork-triggered workflows, and its `GITHUB_TOKEN` is read-only). `pull_request_target` runs in the context of the base branch, so take care not to execute untrusted code from the fork. This action is safe under `pull_request_target` because it only reads the diff and posts a comment — it does not execute code from the PR branch. The checkout uses `pull_request.head.sha` to fetch the correct diff, while the workflow itself runs from the base branch. If your repository does not accept fork PRs, you can switch the trigger to `pull_request` without other changes.
->
-> The `issues: read` permission is used to link affected sorries to open GitHub issues labeled `proof wanted`.
+> **Why `pull_request_target`?** It lets the workflow run for fork PRs *with* access to secrets (the `pull_request` event gives fork-triggered runs a read-only token and no secrets). The job runs from your **default branch**, not the PR branch — so this is also why a workflow change only takes effect once merged to the default branch. The action is safe here because it only *reads* the diff (checked out at `pull_request.head.sha`) and posts a comment; it never executes code from the PR branch. If you don't accept fork PRs, you can switch the trigger to `pull_request` with no other changes.
+
+### 3. Model
+
+The action defaults to **`deepseek/deepseek-v4-flash`**, so you don't need to set `model` at all. It's a strong fit for this pipeline: cheap (≈ $0.09 / $0.18 per 1M input/output tokens), a 1M-token context window (even large PRs fit comfortably), capable on technical/Lean content, and it advertises full structured-output (JSON-schema) support — which the triage and per-file summarizer steps rely on.
+
+To use a different model, set the `model` input to any [OpenRouter slug](https://openrouter.ai/models) (run `curl -s https://openrouter.ai/api/v1/models` for the live catalogue and pricing). Triage and per-file summaries use schema-validated JSON, so prefer a model that advertises `structured_outputs` (most current instruction-following models do; the action also enables OpenRouter's response-healing as a fallback). `reasoning_effort` is honored by reasoning-capable models and silently ignored by the rest.
+
+### 4. Size the diff budgets to your model (optional)
+
+`max_file_diff_chars` and `max_instructions_diff_chars` bound how much diff is sent to the summarizer and the additional-instructions agent. The defaults (60k / 400k chars ≈ 15k / 100k tokens) fit every model in the table above (all ≥128k context). Lower them for a smaller-context model; raise `max_file_diff_chars` to truncate large files less, at higher token cost. See [Inputs](#inputs) for the line↔char rule of thumb.
+
+### 5. Verify it works
+
+Open or push to a PR. The action posts (and thereafter updates) a single **🤖 PR Summary** comment. Check the run under the repository's **Actions** tab — the logs end with a cumulative token-usage line. The comment is keyed by a hidden marker, so subsequent commits update the same comment rather than adding new ones.
 
 ## Inputs
 
@@ -83,7 +108,7 @@ jobs:
 |---|---|---|---|
 | `github_token` | GitHub token for API calls. Should be set to `${{ secrets.GITHUB_TOKEN }}`. | Yes | |
 | `api_key` | OpenRouter API key. Store as a repository secret. | Yes | |
-| `model` | OpenRouter model slug (e.g., `anthropic/claude-opus-4.8`, `google/gemini-3-pro-preview`, `openai/gpt-5`). | Yes | |
+| `model` | OpenRouter model slug. Omit to use the default; override with any slug (e.g., `google/gemma-4-26b-a4b-it`, `openai/gpt-5-mini`). | No | `deepseek/deepseek-v4-flash` |
 | `github_repository` | The GitHub repository in `owner/repo` format. | Yes | |
 | `pr_number` | The pull request number. | Yes | |
 | `lean_keywords` | Comma-separated list of Lean declaration keywords to track for sorry attribution. | No | `def,abbrev,example,theorem,opaque,lemma,instance,constant,axiom` |
